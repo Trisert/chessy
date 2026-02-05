@@ -136,6 +136,30 @@ impl Position {
         Ok(position)
     }
 
+    /// Create a position from a board with custom state (for move validation)
+    pub fn from_board_with_state(
+        board: Board,
+        side_to_move: Color,
+        castling_rights: u8,
+        ep_square: Option<Square>,
+    ) -> Self {
+        let mut position = Position {
+            board,
+            state: PositionState {
+                side_to_move,
+                castling_rights,
+                ep_square,
+                halfmove_clock: 0,
+                fullmove_number: 1,
+                hash: 0,
+            },
+            history: Vec::new(),
+            history_hashes: Vec::new(),
+        };
+        position.state.hash = position.compute_hash();
+        position
+    }
+
     /// Make a move on the position
     pub fn make_move(&mut self, mv: Move) {
         // Save current state to history

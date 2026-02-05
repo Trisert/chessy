@@ -2,6 +2,7 @@ use crate::bitboard::Bitboard;
 use crate::board::Board;
 use crate::movelist::MoveList;
 use crate::piece::{Color, Piece, PieceType};
+use crate::position::Position;
 use crate::r#move::Move;
 use crate::utils::*;
 use crate::PromotionType;
@@ -48,11 +49,19 @@ impl MoveGen {
         ep_square: Option<Square>,
         castling_rights: u8,
     ) -> MoveList {
+        // Create a temporary Position for legal move checking
+        let temp_position = Position::from_board_with_state(
+            board.clone(),
+            side_to_move,
+            castling_rights,
+            ep_square,
+        );
+
         let pseudo_moves = Self::generate_moves_ep(board, side_to_move, ep_square, castling_rights);
         let mut legal_moves = MoveList::new();
 
         for mv in pseudo_moves.iter() {
-            if Self::is_move_legal(board, mv, side_to_move) {
+            if Self::is_move_legal(&temp_position, mv, side_to_move) {
                 legal_moves.push(mv);
             }
         }
@@ -71,18 +80,19 @@ impl MoveGen {
     }
 
     /// Check if a move is legal (doesn't leave king in check)
-    pub fn is_move_legal(board: &Board, mv: Move, side_to_move: Color) -> bool {
-        // Make the move
-        let mut test_board = board.clone();
-        Self::make_move_raw(&mut test_board, mv, side_to_move);
+    /// Uses Position for proper state handling (castling, en passant, etc.)
+    pub fn is_move_legal(position: &Position, mv: Move, side_to_move: Color) -> bool {
+        // Make the move using Position to properly update all state
+        let mut test_position = position.clone();
+        test_position.make_move(mv);
 
         // Check if king is in check
-        let king_sq = match test_board.king_square(side_to_move) {
+        let king_sq = match test_position.board.king_square(side_to_move) {
             Some(sq) => sq,
             None => return false, // King captured (shouldn't happen)
         };
 
-        !Self::is_square_attacked(&test_board, king_sq, side_to_move.flip())
+        !Self::is_square_attacked(&test_position.board, king_sq, side_to_move.flip())
     }
 
     /// Check if a square is attacked by the given color
