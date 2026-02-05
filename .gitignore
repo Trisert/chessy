@@ -8,6 +8,9 @@ trace*.uci
 test*.uci
 test*.sh
 check*.sh
+trace*.sh
 debug*.rs
 illegal_moves_analysis.txt
 cutechess-cli
+test_king
+test_king.c
