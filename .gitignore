@@ -1,0 +1,13 @@
+/target
+*.uci
+*.pgn
+*.txt
+match*.txt
+engine_match*.txt
+trace*.uci
+test*.uci
+test*.sh
+check*.sh
+debug*.rs
+illegal_moves_analysis.txt
+cutechess-cli
