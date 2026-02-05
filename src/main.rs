@@ -1,9 +1,9 @@
 use chessy::movegen::MoveGen;
-use chessy::piece::Color;
+use chessy::piece::{Color, PieceType};
 use chessy::position::Position;
 use chessy::r#move::{Move, PromotionType};
 use chessy::search::Search;
-use chessy::utils::square_from_string;
+use chessy::utils::{square_from_string, square_to_string};
 use std::io::{self, BufRead};
 use std::sync::atomic::AtomicBool;
 use std::sync::{mpsc, Arc};
@@ -130,6 +130,42 @@ fn handle_position(parts: &[&str], position: &mut Position) {
         if parts.len() > 2 && parts[2] == "moves" {
             for i in 3..parts.len() {
                 if let Ok(mv) = move_from_string(parts[i]) {
+                    let from_sq = mv.from();
+                    // Check if there's actually a piece on the from square BEFORE making the move
+                    if position.board.get_piece(from_sq).is_none() {
+                        eprintln!("STATE CORRUPTION: No piece on {} for move '{}' (move #{}/{})",
+                                  square_to_string(from_sq), parts[i], i - 2, parts.len() - 3);
+                        eprintln!("  This indicates board state desynchronization!");
+                        eprintln!("  Current board:");
+                        for rank in (0..8).rev() {
+                            eprint!("{}  ", rank + 1);
+                            for file in 0..8 {
+                                let sq = rank * 8 + file;
+                                if let Some(piece) = position.board.get_piece(sq) {
+                                    let piece_char = match (piece.color, piece.piece_type) {
+                                        (Color::White, PieceType::Pawn) => 'P',
+                                        (Color::White, PieceType::Knight) => 'N',
+                                        (Color::White, PieceType::Bishop) => 'B',
+                                        (Color::White, PieceType::Rook) => 'R',
+                                        (Color::White, PieceType::Queen) => 'Q',
+                                        (Color::White, PieceType::King) => 'K',
+                                        (Color::Black, PieceType::Pawn) => 'p',
+                                        (Color::Black, PieceType::Knight) => 'n',
+                                        (Color::Black, PieceType::Bishop) => 'b',
+                                        (Color::Black, PieceType::Rook) => 'r',
+                                        (Color::Black, PieceType::Queen) => 'q',
+                                        (Color::Black, PieceType::King) => 'k',
+                                    };
+                                    eprint!("{}", piece_char);
+                                } else {
+                                    eprint!(".");
+                                }
+                                eprint!(" ");
+                            }
+                            eprintln!();
+                        }
+                        eprintln!("   a b c d e f g h");
+                    }
                     position.make_move(mv);
                 } else {
                     eprintln!("ERROR: Failed to parse move '{}'", parts[i]);
@@ -157,9 +193,15 @@ fn handle_position(parts: &[&str], position: &mut Position) {
 fn handle_go(
     parts: &[&str],
     position: &mut Position,
-    _search: &mut Search,
+    search: &mut Search,
     stop_signal: &Arc<AtomicBool>,
 ) {
+    // Debug: log current position before searching
+    eprintln!("=== GO command received ===");
+    eprintln!("  Side to move: {:?}", position.state.side_to_move);
+    eprintln!("  FEN: {}", position.to_fen());
+    eprintln!("========================");
+
     // Parse go command parameters
     let mut wtime: Option<u64> = None;
     let mut btime: Option<u64> = None;
