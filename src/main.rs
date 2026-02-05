@@ -131,6 +131,8 @@ fn handle_position(parts: &[&str], position: &mut Position) {
             for i in 3..parts.len() {
                 if let Ok(mv) = move_from_string(parts[i]) {
                     position.make_move(mv);
+                } else {
+                    eprintln!("ERROR: Failed to parse move '{}'", parts[i]);
                 }
             }
         }
