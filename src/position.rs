@@ -490,18 +490,6 @@ impl Position {
             eprintln!("=== Skipping this move, continuing with rest of sequence ===");
             return;
         }
-
-        // Update side to move
-        self.state.side_to_move = color.flip();
-
-        // Update castling rights
-        self.update_castling_rights(from, to);
-
-        // Update en passant square
-        self.update_ep_square(mv, color);
-
-        // Recompute hash
-        self.state.hash = self.compute_hash();
     }
 
     /// Update castling rights after a move
