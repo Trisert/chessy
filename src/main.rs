@@ -178,12 +178,6 @@ fn handle_go(
     search: &mut Search,
     stop_signal: &Arc<AtomicBool>,
 ) {
-    // Debug: log current position before searching
-    eprintln!("=== GO command received ===");
-    eprintln!("  Side to move: {:?}", position.state.side_to_move);
-    eprintln!("  FEN: {}", position.to_fen());
-    eprintln!("========================");
-
     // Parse go command parameters
     let mut wtime: Option<u64> = None;
     let mut btime: Option<u64> = None;
