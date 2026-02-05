@@ -209,61 +209,8 @@ impl Position {
             self.state.fullmove_number += 1;
         }
 
-        // Debug: Check specific moves BEFORE making them
-        if mv.to() == 3 || mv.from() == 10 || mv.from() == 3 || mv.from() == 6 || mv.to() == 6 {
-            eprintln!("=== DEBUG: BEFORE Move involving d1/c2/g1 ===");
-            eprintln!("Move: {}", mv);
-            eprintln!("From: {} ({})", mv.from(), crate::utils::square_to_string(mv.from()));
-            eprintln!("To: {} ({})", mv.to(), crate::utils::square_to_string(mv.to()));
-            eprintln!("Is promotion: {}", mv.is_promotion());
-
-            // Check what pieces are on the FROM square before move
-            let pieces_on_from = self.board.debug_get_pieces_on(mv.from());
-            eprintln!("Pieces on from square: {:?}", pieces_on_from);
-
-            // Check king squares before
-            let white_king = self.board.king_square(crate::piece::Color::White);
-            eprintln!("White king square BEFORE: {:?}", white_king);
-
-            if let Err(err) = self.board.validate() {
-                eprintln!("VALIDATION ERROR BEFORE MOVE:\n{}", err);
-                self.board.debug_print();
-            }
-            eprintln!("====================================");
-        }
-
         // Make the move on the board
         self.make_move_on_board(mv, color);
-
-        // Debug: Check same moves AFTER making them
-        if mv.to() == 3 || mv.from() == 10 || mv.from() == 3 || mv.from() == 6 || mv.to() == 6 {
-            eprintln!("=== DEBUG: AFTER Move involving d1/c2/g1 ===");
-
-            // Check what pieces are on the TO square after move
-            let pieces_on_to = self.board.debug_get_pieces_on(mv.to());
-            eprintln!("Pieces on to square: {:?}", pieces_on_to);
-
-            // Check king squares after
-            let white_king = self.board.king_square(crate::piece::Color::White);
-            eprintln!("White king square AFTER: {:?}", white_king);
-
-            if let Err(err) = self.board.validate() {
-                eprintln!("VALIDATION ERROR AFTER MOVE:\n{}", err);
-                self.board.debug_print();
-            }
-            eprintln!("====================================");
-        }
-
-        // Validate board state after move
-        if let Err(err) = self.board.validate() {
-            eprintln!("=== BOARD STATE CORRUPTION DETECTED ===");
-            eprintln!("After move: {}", mv);
-            eprintln!("Side to move: {:?}", color);
-            eprintln!("ERROR:\n{}", err);
-            eprintln!("\nCurrent board:");
-            self.board.debug_print();
-            eprintln!("====================================");
-        }
 
         // Update side to move
         self.state.side_to_move = color.flip();
@@ -438,21 +385,6 @@ impl Position {
 
         // Normal move
         if let Some(piece) = self.board.get_piece(from) {
-            // Debug: check for d1b3 specifically
-            if from == 3 && to == 17 {
-                eprintln!("=== DEBUG: Making move from d1 to b3 ===");
-                eprintln!("Piece from d1: {:?}", piece);
-                eprintln!("Piece type: {:?}, Color: {:?}", piece.piece_type, piece.color);
-
-                // Check what's actually on d1 in the bitboards
-                let pieces_on_d1 = self.board.debug_get_pieces_on(3);
-                eprintln!("Pieces on d1: {:?}", pieces_on_d1);
-                for (c, pt) in pieces_on_d1 {
-                    eprintln!("  {:?} {:?}", c, pt);
-                }
-                self.board.debug_print();
-            }
-
             self.board.remove_piece(piece, from);
 
             // Handle captures
