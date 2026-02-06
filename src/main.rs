@@ -321,18 +321,13 @@ fn handle_go(
         // Attach the stop signal to the existing search (preserves TT)
         search_to_move.set_stop_signal(stop_signal_for_search);
 
-        let time_limit = if let Some(mt) = movetime {
-            Some(mt)
-        } else if let Some(_) = mate {
-            None // Use depth for mate search
-        } else if let Some(_n) = nodes {
-            // Search until node count reached (will be checked in loop)
-            None
-        } else {
-            time_ms
+        let time_limit = match (movetime, mate, nodes) {
+            (Some(mt), _, _) => Some(mt),
+            (_, Some(_), _) | (_, _, Some(_)) => None,
+            _ => time_ms,
         };
 
-        let search_depth = if mate.is_some() { mate.unwrap() } else { depth };
+        let search_depth = mate.unwrap_or(depth);
 
         let (best_move, _score) = search_to_move.search(&position_clone, search_depth, time_limit);
 
@@ -368,15 +363,16 @@ fn handle_go(
 
         // Stop the search
         stop_signal.store(true, std::sync::atomic::Ordering::Relaxed);
-    } else if let Some(n) = nodes {
-        // Search until node count reached
+    } else if nodes.is_some() {
+        // Search until node count reached (enforced internally)
+        // Note: The search thread sends only one result when complete
         loop {
             match rx.recv_timeout(Duration::from_millis(100)) {
-                Ok((mv, searched_nodes)) => {
-                    if searched_nodes >= n {
-                        best_move = mv;
-                        break;
-                    }
+                Ok((mv, _searched_nodes)) => {
+                    // Always accept the result when the search completes
+                    // The node limit is enforced inside the search itself
+                    best_move = mv;
+                    break;
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     if stop_signal.load(std::sync::atomic::Ordering::Relaxed) {
@@ -626,8 +622,10 @@ fn calculate_time_budget(
     // For bullet, use extremely small minimum and proportional buffer
     let allocated = if is_bullet {
         // For bullet: minimum 10ms, with proportional buffer (1/4 to 200ms max)
+        // Ensure we don't underflow when subtracting buffer
         let buffer = (my_time / 4).min(200);
-        allocated.max(10).min(my_time.saturating_sub(buffer))
+        let capped = my_time.saturating_sub(buffer).max(10);
+        allocated.max(10).min(capped)
     } else {
         allocated.max(100).min(my_time.saturating_sub(50))
     };
@@ -648,21 +646,12 @@ fn move_from_string(s: &str) -> Result<Move, String> {
     // Detect castling moves in UCI format
     // Kingside: e1g1 (white), e8g8 (black)
     // Queenside: e1c1 (white), e8c8 (black)
-    // NOTE: UCI sends king destination (g1/g8/c1/c8), but we encode castling
-    // as "king captures rook" (h1/h8/a1/a8), so we need to convert
+    // Our encoding uses the king's destination directly
     let is_castle = (from == 4 && (to == 6 || to == 2)) ||   // White: e1 to g1 or c1
                     (from == 60 && (to == 62 || to == 58)); // Black: e8 to g8 or c8
 
     if is_castle {
-        // Convert UCI destination to internal encoding (rook square)
-        let rook_sq = match (from, to) {
-            (4, 6) => 7,    // White kingside: king goes to g1(6), but we encode as capturing h1(7)
-            (4, 2) => 0,    // White queenside: king goes to c1(2), but we encode as capturing a1(0)
-            (60, 62) => 63, // Black kingside: king goes to g8(62), but we encode as capturing h8(63)
-            (60, 58) => 56, // Black queenside: king goes to c8(58), but we encode as capturing a8(56)
-            _ => to,        // Should not reach here
-        };
-        return Ok(Move::castle(from, rook_sq));
+        return Ok(Move::castle(from, to));
     }
 
     // Handle promotion

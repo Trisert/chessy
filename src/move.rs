@@ -4,8 +4,8 @@ use crate::utils::Square;
 ///
 /// Bits 0-5:   Source square (0-63)
 /// Bits 6-11:  Destination square (0-63)
-/// Bits 12-14: Promotion piece (0-3) or special flag
-/// Bit 15:     Special move flag (castle, en passant, promotion)
+/// Bits 12-14: Special flag (1 = en passant, 2 = castle, 4-7 = promotion piece + 4)
+/// Bit 15:     Special move flag (set for castle, en passant, and promotion)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Move(pub u16);
 

@@ -110,8 +110,12 @@ impl Zobrist {
     }
 }
 
-/// Simple random number generator (xorshift64*)
-/// Uses standard xorshift64* algorithm
+/// Simple random number generator (xorshift64* variant)
+///
+/// This is a variant of xorshift64* where the multiply is applied to the state
+/// itself rather than just being an output scrambler. This preserves the
+/// non-zero invariant (unlike canonical xorshift64* which returns state * mult
+/// without modifying state).
 fn random_u64(state: &mut u64) -> u64 {
     *state ^= *state >> 12;
     *state ^= *state << 25;
