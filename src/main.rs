@@ -36,8 +36,8 @@ fn main() {
 fn run_uci_mode() {
     let stdin = io::stdin();
     let mut position = Position::from_start();
-    let mut search = Search::new();
     let stop_signal = Arc::new(AtomicBool::new(false));
+    let mut search = Search::with_stop_signal(stop_signal.clone());
 
     loop {
         let mut line = String::new();

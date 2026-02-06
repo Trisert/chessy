@@ -4,7 +4,7 @@ use crate::piece::Color;
 use crate::position::Position;
 use crate::r#move::Move;
 use crate::transposition::{TTFlag, TranspositionTable};
-use std::cell::UnsafeCell;
+use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -17,10 +17,10 @@ pub struct Search {
     external_stop: Option<Arc<AtomicBool>>,
     /// Nodes searched
     nodes: AtomicU64,
-    /// Search start time (wrapped for interior mutability)
-    start_time: UnsafeCell<Instant>,
-    /// Time limit (wrapped for interior mutability)
-    time_limit: UnsafeCell<Option<Duration>>,
+    /// Search start time (interior mutability for single-threaded access)
+    start_time: Cell<Instant>,
+    /// Time limit (interior mutability for single-threaded access)
+    time_limit: Cell<Option<Duration>>,
     /// Transposition table
     tt: TranspositionTable,
 }
@@ -32,8 +32,8 @@ impl Search {
             stop: AtomicBool::new(false),
             external_stop: None,
             nodes: AtomicU64::new(0),
-            start_time: UnsafeCell::new(Instant::now()),
-            time_limit: UnsafeCell::new(None),
+            start_time: Cell::new(Instant::now()),
+            time_limit: Cell::new(None),
             tt: TranspositionTable::new(256), // 256 MB TT
         }
     }
@@ -44,8 +44,8 @@ impl Search {
             stop: AtomicBool::new(false),
             external_stop: Some(external_stop),
             nodes: AtomicU64::new(0),
-            start_time: UnsafeCell::new(Instant::now()),
-            time_limit: UnsafeCell::new(None),
+            start_time: Cell::new(Instant::now()),
+            time_limit: Cell::new(None),
             tt: TranspositionTable::new(256),
         }
     }
@@ -56,8 +56,8 @@ impl Search {
             stop: AtomicBool::new(false),
             external_stop: None,
             nodes: AtomicU64::new(0),
-            start_time: UnsafeCell::new(Instant::now()),
-            time_limit: UnsafeCell::new(None),
+            start_time: Cell::new(Instant::now()),
+            time_limit: Cell::new(None),
             tt: TranspositionTable::new(tt_size_mb),
         }
     }
@@ -68,8 +68,8 @@ impl Search {
             stop: AtomicBool::new(false),
             external_stop: Some(external_stop),
             nodes: AtomicU64::new(0),
-            start_time: UnsafeCell::new(Instant::now()),
-            time_limit: UnsafeCell::new(None),
+            start_time: Cell::new(Instant::now()),
+            time_limit: Cell::new(None),
             tt: TranspositionTable::new(tt_size_mb),
         }
     }
@@ -97,10 +97,8 @@ impl Search {
         // Reset search state
         self.stop.store(false, Ordering::Relaxed);
         self.nodes.store(0, Ordering::Relaxed);
-        unsafe {
-            *self.start_time.get() = Instant::now();
-            *self.time_limit.get() = time_ms.map(Duration::from_millis);
-        }
+        self.start_time.set(Instant::now());
+        self.time_limit.set(time_ms.map(Duration::from_millis));
 
         // New search generation for TT
         self.tt.new_generation();
@@ -170,7 +168,7 @@ impl Search {
                 best_score = score;
 
                 // Print UCI info
-                let elapsed = unsafe { (*self.start_time.get()).elapsed() };
+                let elapsed = self.start_time.get().elapsed();
                 let nodes = self.nodes.load(Ordering::Relaxed);
                 let nps = if elapsed.as_secs_f64() > 0.0 {
                     nodes as f64 / elapsed.as_secs_f64()
@@ -272,11 +270,17 @@ impl Search {
                             if entry.score >= beta {
                                 return (tt_move, entry.score);
                             }
+                            // Tighten alpha bound
+                            if entry.score > alpha {
+                                alpha = entry.score;
+                            }
                         }
                         TTFlag::Upper => {
                             if entry.score <= alpha {
                                 return (tt_move, entry.score);
                             }
+                            // Could tighten beta bound here, but beta is not mutable
+                            // We could use the entry for move ordering though
                         }
                     }
                 }
@@ -394,14 +398,12 @@ impl Search {
         }
 
         // Check time limit - use 95% of allocated time to leave safety margin
-        unsafe {
-            if let Some(limit) = *self.time_limit.get() {
-                // Use 95% of time limit to leave margin for move output
-                let effective_limit = limit.mul_f64(0.95);
-                let elapsed = (*self.start_time.get()).elapsed();
-                if elapsed >= effective_limit {
-                    return true;
-                }
+        if let Some(limit) = self.time_limit.get() {
+            // Use 95% of time limit to leave margin for move output
+            let effective_limit = limit.mul_f64(0.95);
+            let elapsed = self.start_time.get().elapsed();
+            if elapsed >= effective_limit {
+                return true;
             }
         }
 
@@ -420,12 +422,8 @@ impl Search {
 
     /// Print search info
     fn print_info(&self) {
-        let (elapsed, nodes) = unsafe {
-            (
-                (*self.start_time.get()).elapsed(),
-                self.nodes.load(Ordering::Relaxed),
-            )
-        };
+        let elapsed = self.start_time.get().elapsed();
+        let nodes = self.nodes.load(Ordering::Relaxed);
         let nps = if elapsed.as_secs_f64() > 0.0 {
             nodes as f64 / elapsed.as_secs_f64()
         } else {
