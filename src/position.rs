@@ -451,10 +451,20 @@ impl Position {
         // Remove piece from old square
         self.update_hash_piece(piece, from);
 
-        // Handle castling (king captures rook encoding)
+        // Handle castling (encoded with king's destination)
         if mv.is_castle() {
             let king_dest = mv.castle_king_destination();
-            let rook_from = to;
+            // Calculate rook's original square based on king's destination
+            let rook_from = match (from, king_dest) {
+                (4, 6) => 7,    // White kingside: e1->g1, rook on h1
+                (4, 2) => 0,    // White queenside: e1->c1, rook on a1
+                (60, 62) => 63, // Black kingside: e8->g8, rook on h8
+                (60, 58) => 56, // Black queenside: e8->c8, rook on a8
+                _ => {
+                    eprintln!("ERROR: Invalid castling move from={} to={}", from, king_dest);
+                    return;
+                }
+            };
             let rook_dest = mv.castle_rook_destination();
 
             // Move the king
@@ -601,7 +611,17 @@ impl Position {
         // Handle castling undo
         if mv.is_castle() {
             let king_dest = mv.castle_king_destination();
-            let rook_from = to;
+            // Calculate rook's original square based on king's destination
+            let rook_from = match (from, king_dest) {
+                (4, 6) => 7,    // White kingside: e1->g1, rook on h1
+                (4, 2) => 0,    // White queenside: e1->c1, rook on a1
+                (60, 62) => 63, // Black kingside: e8->g8, rook on h8
+                (60, 58) => 56, // Black queenside: e8->c8, rook on a8
+                _ => {
+                    eprintln!("ERROR: Invalid castling move from={} to={}", from, king_dest);
+                    return;
+                }
+            };
             let rook_dest = mv.castle_rook_destination();
 
             // Get the king and rook
@@ -798,11 +818,21 @@ impl Position {
         let to = mv.to();
 
         // Handle castling
-        // NOTE: Castling is encoded as "king captures friendly rook"
-        // So 'to' is the ROOK'S square, not the king's destination
+        // NOTE: Castling is encoded with the king's destination
+        // 'to' is the KING'S destination, we need to find the rook's original square
         if mv.is_castle() {
             let king_dest = mv.castle_king_destination();
-            let rook_from = to; // The 'to' square in a castling move is the rook's position
+            // Calculate rook's original square based on king's destination
+            let rook_from = match (from, king_dest) {
+                (4, 6) => 7,    // White kingside: e1->g1, rook on h1
+                (4, 2) => 0,    // White queenside: e1->c1, rook on a1
+                (60, 62) => 63, // Black kingside: e8->g8, rook on h8
+                (60, 58) => 56, // Black queenside: e8->c8, rook on a8
+                _ => {
+                    eprintln!("ERROR: Invalid castling move from={} to={}", from, king_dest);
+                    return;
+                }
+            };
             let rook_dest = mv.castle_rook_destination();
 
             // Move the king
