@@ -69,6 +69,8 @@ pub struct TranspositionTable {
     entries: Box<[TTEntry]>,
     /// Size of the table in bytes
     size_bytes: usize,
+    /// Requested size in megabytes (for accurate reporting)
+    requested_size_mb: usize,
     /// Number of entries in the table
     num_entries: usize,
     /// Mask for indexing into the table (must be power of 2 - 1)
@@ -113,6 +115,7 @@ impl TranspositionTable {
         TranspositionTable {
             entries,
             size_bytes: actual_size,
+            requested_size_mb: size_mb,
             num_entries,
             index_mask,
             current_age: AtomicU64::new(0),
@@ -126,7 +129,7 @@ impl TranspositionTable {
     /// Get the size of the transposition table in megabytes
     #[inline]
     pub fn size_mb(&self) -> usize {
-        self.size_bytes / (1024 * 1024)
+        self.requested_size_mb
     }
 
     /// Get the index for a given hash

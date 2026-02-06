@@ -66,11 +66,13 @@ impl Move {
     }
 
     /// Check if this is a capture move
-    /// Note: This needs board state to be accurate for en passant
+    /// Note: This is a simplified check - only en passant can be detected without board context
+    /// For accurate capture detection, you need to check if there's a piece on the destination square
     #[inline]
     pub const fn is_capture(self) -> bool {
-        // This is a simplified check - actual implementation needs board context
-        (self.0 & 0x1000) != 0
+        // Only en passant (special flag = 1) can be detected without board context
+        // Promotions (4-7) also have bit 12 set but aren't necessarily captures
+        self.is_en_passant()
     }
 
     /// Get the promotion piece type (if any)

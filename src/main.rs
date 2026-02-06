@@ -620,7 +620,7 @@ fn calculate_time_budget(
     allocated = allocated.saturating_add(my_inc);
 
     // For bullet, use extremely small minimum and proportional buffer
-    let allocated = if is_bullet {
+    allocated = if is_bullet {
         // For bullet: minimum 10ms, with proportional buffer (1/4 to 200ms max)
         // Ensure we don't underflow when subtracting buffer
         let buffer = (my_time / 4).min(200);
