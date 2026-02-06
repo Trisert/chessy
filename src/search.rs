@@ -312,8 +312,10 @@ impl Search {
         let mut tt_flag = TTFlag::Upper;
 
         for i in 0..moves.len() {
-            // Check time frequently at root (every move) for bullet chess
-            // Don't skip check for shallow searches - depth 1-2 need it too!
+            // Check time frequently (every move) for bullet chess responsiveness
+            // Note: This involves atomic loads but is crucial for 1+0 bullet where
+            // each move must complete very quickly. The overhead is negligible compared
+            // to the search work done at each node.
             if self.should_stop() {
                 break;
             }

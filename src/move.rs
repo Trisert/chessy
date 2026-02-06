@@ -129,13 +129,16 @@ impl Move {
     pub const fn castle_rook_destination(self) -> Square {
         debug_assert!(self.is_castle(), "castle_rook_destination called on non-castle move");
         let from = self.from();
+        let to = self.to();
+
         // White castling
         if from == 4 {
             // e1 -> g1 (kingside) rook h1->f1
             // e1 -> c1 (queenside) rook a1->d1
-            if self.to() == 6 {
+            if to == 6 {
                 5 // f1
             } else {
+                debug_assert!(to == 2, "unexpected white castle destination");
                 3 // d1
             }
         }
@@ -143,13 +146,15 @@ impl Move {
         else if from == 60 {
             // e8 -> g8 (kingside) rook h8->f8
             // e8 -> c8 (queenside) rook a8->d8
-            if self.to() == 62 {
+            if to == 62 {
                 61 // f8
             } else {
+                debug_assert!(to == 58, "unexpected black castle destination");
                 59 // d8
             }
         } else {
-            self.to() // Fallback for non-castling moves
+            debug_assert!(false, "unexpected king origin for castle");
+            to // Fallback for non-castling moves (only in release builds)
         }
     }
 }
@@ -251,8 +256,8 @@ mod tests {
         let mv = Move::new(12, 28); // e2e4
         assert_eq!(mv.to_string(), "e2e4");
 
-        let mv = Move::promotion(12, 20, PromotionType::Queen); // e2e3q
-        assert_eq!(mv.to_string(), "e2e3q");
+        let mv = Move::promotion(52, 60, PromotionType::Queen); // e7e8q
+        assert_eq!(mv.to_string(), "e7e8q");
 
         let mv = Move::null();
         assert_eq!(mv.to_string(), "0000");
