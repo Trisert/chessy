@@ -129,7 +129,7 @@ fn handle_position(parts: &[&str], position: &mut Position) {
         // Parse moves if present
         if parts.len() > 2 && parts[2] == "moves" {
             for i in 3..parts.len() {
-                if let Ok(mv) = move_from_string(parts[i]) {
+                if let Ok(mv) = move_from_string(parts[i], position.state.ep_square) {
                     let from_sq = mv.from();
                     // Check if there's actually a piece on the from square BEFORE making the move
                     if position.board.get_piece(from_sq).is_none() {
@@ -158,7 +158,7 @@ fn handle_position(parts: &[&str], position: &mut Position) {
             // Parse moves if present
             if let Some(moves_idx) = parts.iter().position(|&x| x == "moves") {
                 for i in (moves_idx + 1)..parts.len() {
-                    if let Ok(mv) = move_from_string(parts[i]) {
+                    if let Ok(mv) = move_from_string(parts[i], position.state.ep_square) {
                         let from_sq = mv.from();
                         // Check if there's actually a piece on the from square BEFORE making the move
                         if position.board.get_piece(from_sq).is_none() {
@@ -599,6 +599,7 @@ fn calculate_time_budget(
     // This is extremely aggressive but necessary for 1+0
     let is_bullet = my_time < 2000; // Less than 2 seconds = bullet
     let time_fraction = if is_bullet {
+        // Bullet: use fixed fractions based on game phase
         if moves_left <= 10 {
             20
         } else if moves_left >= 30 {
@@ -607,16 +608,12 @@ fn calculate_time_budget(
             25
         }
     } else {
-        if moves_left <= 10 {
-            3
-        } else if moves_left >= 30 {
-            5
-        } else {
-            4
-        }
+        // Non-bullet: use moves_left directly (remaining time / remaining moves)
+        // This avoids front-loading time and prevents time trouble
+        moves_left.max(1)
     };
 
-    let mut allocated = my_time / time_fraction;
+    let mut allocated = my_time / time_fraction as u64;
     allocated = allocated.saturating_add(my_inc);
 
     // For bullet, use extremely small minimum and proportional buffer
@@ -633,7 +630,7 @@ fn calculate_time_budget(
     Some(allocated)
 }
 
-fn move_from_string(s: &str) -> Result<Move, String> {
+fn move_from_string(s: &str, ep_square: Option<chessy::utils::Square>) -> Result<Move, String> {
     if s.len() < 4 {
         return Err("Move string too short".to_string());
     }
@@ -652,6 +649,16 @@ fn move_from_string(s: &str) -> Result<Move, String> {
 
     if is_castle {
         return Ok(Move::castle(from, to));
+    }
+
+    // Detect en passant
+    // En passant: diagonal pawn move to the ep_square
+    let is_pawn_move = matches!(from % 8, 0 | 7); // Pawns are on ranks 1 and 6 (indices 8-15 and 48-55)
+    let file_diff = (from as i8 - to as i8).abs() == 1; // Diagonal move
+    if let Some(ep) = ep_square {
+        if is_pawn_move && file_diff && to == ep {
+            return Ok(Move::en_passant(from, to));
+        }
     }
 
     // Handle promotion
