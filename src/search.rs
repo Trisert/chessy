@@ -74,6 +74,28 @@ impl Search {
         }
     }
 
+    /// Get the TT size in MB
+    pub fn tt_size_mb(&self) -> usize {
+        self.tt.size_mb()
+    }
+
+    /// Set external stop signal (for use in spawned threads)
+    pub fn set_stop_signal(&mut self, external_stop: Arc<AtomicBool>) {
+        self.external_stop = Some(external_stop);
+    }
+
+    /// Create a new search with custom TT size and external stop signal (alternative name)
+    pub fn with_config_and_stop(tt_size_mb: usize, external_stop: Arc<AtomicBool>) -> Self {
+        Search {
+            stop: AtomicBool::new(false),
+            external_stop: Some(external_stop),
+            nodes: AtomicU64::new(0),
+            start_time: UnsafeCell::new(Instant::now()),
+            time_limit: UnsafeCell::new(None),
+            tt: TranspositionTable::new(tt_size_mb),
+        }
+    }
+
     /// Run an iterative deepening search
     pub fn search(&mut self, position: &Position, depth: u32, time_ms: Option<u64>) -> (Move, i32) {
         // Debug: Validate position before search
@@ -132,7 +154,9 @@ impl Search {
                 break;
             }
 
-            let (mv, score) = self.alphabeta(position, d, -32000, 32000);
+            // Clone position for this depth iteration (alphabeta uses make_move_fast/undo_move_fast)
+            let mut search_position = position.clone();
+            let (mv, score) = self.alphabeta(&mut search_position, d, -32000, 32000);
 
             // Check time after each depth iteration for bullet games
             // This is crucial for 1+0 bullet where each move must be very fast
@@ -201,7 +225,7 @@ impl Search {
     }
 
     /// Alpha-beta search
-    fn alphabeta(&self, position: &Position, depth: u32, mut alpha: i32, beta: i32) -> (Move, i32) {
+    fn alphabeta(&self, position: &mut Position, depth: u32, mut alpha: i32, beta: i32) -> (Move, i32) {
         if self.should_stop() {
             return (Move::null(), 0);
         }
@@ -266,7 +290,6 @@ impl Search {
                                 return (tt_move, entry.score);
                             }
                         }
-                        _ => {}
                     }
                 }
             }
@@ -297,15 +320,17 @@ impl Search {
 
             let mv = moves.get(i);
 
-            // Make move by cloning (safe for recursion)
-            let mut new_position = position.clone();
-            new_position.make_move(mv);
+            // Make move using fast do/unmake
+            position.make_move_fast(mv);
 
             // Search with negated score
-            let (_, score) = self.alphabeta(&new_position, depth - 1, -beta, -alpha);
+            let (_, score) = self.alphabeta(position, depth - 1, -beta, -alpha);
 
             // Negate score for opponent's perspective
             let score = -score;
+
+            // Undo the move
+            position.undo_move_fast();
 
             if score > alpha {
                 alpha = score;
@@ -362,13 +387,10 @@ impl Search {
         }
 
         // Check external stop signal (from main thread)
-        // No minimum time for time limit checks - we want to stop promptly
-        let elapsed = unsafe { (*self.start_time.get()).elapsed() };
-        if elapsed >= Duration::from_millis(10) {
-            if let Some(ref external) = self.external_stop {
-                if external.load(Ordering::Relaxed) {
-                    return true;
-                }
+        // Check immediately without any delay - we want to respond to UCI stop instantly
+        if let Some(ref external) = self.external_stop {
+            if external.load(Ordering::Relaxed) {
+                return true;
             }
         }
 
@@ -377,6 +399,7 @@ impl Search {
             if let Some(limit) = *self.time_limit.get() {
                 // Use 95% of time limit to leave margin for move output
                 let effective_limit = limit.mul_f64(0.95);
+                let elapsed = (*self.start_time.get()).elapsed();
                 if elapsed >= effective_limit {
                     return true;
                 }

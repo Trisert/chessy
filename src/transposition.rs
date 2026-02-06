@@ -123,6 +123,12 @@ impl TranspositionTable {
         }
     }
 
+    /// Get the size of the transposition table in megabytes
+    #[inline]
+    pub fn size_mb(&self) -> usize {
+        self.size_bytes / (1024 * 1024)
+    }
+
     /// Get the index for a given hash
     #[inline]
     fn get_index(&self, hash: u64) -> usize {

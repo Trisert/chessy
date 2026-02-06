@@ -183,7 +183,7 @@ fn handle_position(parts: &[&str], position: &mut Position) {
 fn handle_go(
     parts: &[&str],
     position: &mut Position,
-    _search: &mut Search,
+    search: &mut Search,
     stop_signal: &Arc<AtomicBool>,
 ) {
     // IMPORTANT: Reset stop signal before starting a new search
@@ -306,9 +306,15 @@ fn handle_go(
     // Clone stop signal for the search thread
     let stop_signal_for_search = stop_signal.clone();
 
+    // Move the configured search into the thread (TT configuration is preserved)
+    // Note: After this move, the main thread's search reference is invalidated
+    // It will be recreated on the next ucinewgame or setoption command
+    let mut search_to_move = std::mem::replace(search, Search::new());
+
     // Spawn search thread
     thread::spawn(move || {
-        let mut search = Search::with_stop_signal(stop_signal_for_search);
+        // Attach the stop signal to the existing search (preserves TT)
+        search_to_move.set_stop_signal(stop_signal_for_search);
 
         let time_limit = if let Some(mt) = movetime {
             Some(mt)
@@ -323,9 +329,9 @@ fn handle_go(
 
         let search_depth = if mate.is_some() { mate.unwrap() } else { depth };
 
-        let (best_move, _score) = search.search(&position_clone, search_depth, time_limit);
+        let (best_move, _score) = search_to_move.search(&position_clone, search_depth, time_limit);
 
-        tx.send((best_move, search.nodes())).ok();
+        tx.send((best_move, search_to_move.nodes())).ok();
     });
 
     // Wait for result or stop signal
@@ -582,10 +588,11 @@ fn calculate_time_budget(
     let mut allocated = my_time / time_fraction;
     allocated = allocated.saturating_add(my_inc);
 
-    // For bullet, use extremely small minimum and very large buffer
+    // For bullet, use extremely small minimum and proportional buffer
     let allocated = if is_bullet {
-        // For bullet: minimum 10ms, but leave 200ms buffer
-        allocated.max(10).min(my_time.saturating_sub(200))
+        // For bullet: minimum 10ms, with proportional buffer (1/4 to 200ms max)
+        let buffer = (my_time / 4).min(200);
+        allocated.max(10).min(my_time.saturating_sub(buffer))
     } else {
         allocated.max(100).min(my_time.saturating_sub(50))
     };
