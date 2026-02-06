@@ -84,18 +84,6 @@ impl Search {
         self.external_stop = Some(external_stop);
     }
 
-    /// Create a new search with custom TT size and external stop signal (alternative name)
-    pub fn with_config_and_stop(tt_size_mb: usize, external_stop: Arc<AtomicBool>) -> Self {
-        Search {
-            stop: AtomicBool::new(false),
-            external_stop: Some(external_stop),
-            nodes: AtomicU64::new(0),
-            start_time: UnsafeCell::new(Instant::now()),
-            time_limit: UnsafeCell::new(None),
-            tt: TranspositionTable::new(tt_size_mb),
-        }
-    }
-
     /// Run an iterative deepening search
     pub fn search(&mut self, position: &Position, depth: u32, time_ms: Option<u64>) -> (Move, i32) {
         // Debug: Validate position before search
@@ -346,6 +334,12 @@ impl Search {
             }
         }
 
+        // Don't store partial results from aborted searches - they may contain
+        // incorrect scores from early-exit returns of (Move::null(), 0)
+        if self.should_stop() {
+            return (best_move, alpha);
+        }
+
         // Store in transposition table
         self.tt
             .store(position.state.hash, best_move, alpha, depth as u8, tt_flag);
@@ -361,19 +355,19 @@ impl Search {
             }
             if !move_is_legal {
                 // Debug: This should never happen if our search is working correctly
-                println!(
+                eprintln!(
                     "WARNING: Alpha-beta returned illegal move {} at depth {}",
                     best_move, depth
                 );
-                println!("Available legal moves: {}", moves.len());
+                eprintln!("Available legal moves: {}", moves.len());
 
                 // If best_move is not legal, return the first legal move instead
                 if moves.len() > 0 {
                     best_move = moves.get(0);
-                    println!("Fallback: Using first legal move {}", best_move);
+                    eprintln!("Fallback: Using first legal move {}", best_move);
                 } else {
                     best_move = Move::null();
-                    println!("Fallback: No legal moves available");
+                    eprintln!("Fallback: No legal moves available");
                 }
             }
         }

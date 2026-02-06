@@ -252,7 +252,8 @@ impl Position {
         }
 
         // Update halfmove clock
-        let is_capture = self.board.get_piece(to).is_some();
+        // Castling is encoded as "king captures rook" - exclude it from capture detection
+        let is_capture = !mv.is_castle() && self.board.get_piece(to).is_some();
         let is_pawn_move = piece.piece_type == crate::piece::PieceType::Pawn;
 
         if is_capture || is_pawn_move {
@@ -396,8 +397,11 @@ impl Position {
         let old_rights = self.state.castling_rights;
         let old_ep = self.state.ep_square;
 
-        // Determine captured piece (handle en passant specially)
-        let captured = if mv.is_en_passant() {
+        // Determine captured piece (handle en passant and castling specially)
+        let captured = if mv.is_castle() {
+            // Castling is encoded as "king captures rook" - no actual capture
+            None
+        } else if mv.is_en_passant() {
             let ep_capture_sq = if color == Color::White {
                 to - 8
             } else {
