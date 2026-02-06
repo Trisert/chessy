@@ -1,5 +1,5 @@
 use chessy::movegen::MoveGen;
-use chessy::piece::{Color, PieceType};
+use chessy::piece::Color;
 use chessy::position::Position;
 use chessy::r#move::{Move, PromotionType};
 use chessy::search::Search;
@@ -36,8 +36,8 @@ fn main() {
 fn run_uci_mode() {
     let stdin = io::stdin();
     let mut position = Position::from_start();
-    let mut _search = Search::new();
     let stop_signal = Arc::new(AtomicBool::new(false));
+    let mut search = Search::with_stop_signal(stop_signal.clone());
 
     loop {
         let mut line = String::new();
@@ -63,7 +63,7 @@ fn run_uci_mode() {
                 println!("readyok");
             }
             "ucinewgame" => {
-                _search = Search::with_stop_signal(stop_signal.clone());
+                search = Search::with_stop_signal(stop_signal.clone());
                 position = Position::from_start();
             }
             "position" => {
@@ -71,7 +71,7 @@ fn run_uci_mode() {
             }
             "go" => {
                 let stop_signal_clone = stop_signal.clone();
-                handle_go(&parts, &mut position, &mut _search, &stop_signal_clone);
+                handle_go(&parts, &mut position, &mut search, &stop_signal_clone);
             }
             "stop" => {
                 stop_signal.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -86,7 +86,7 @@ fn run_uci_mode() {
                     let value = parts[4];
                     if name == "Hash" {
                         if let Ok(size_mb) = value.parse::<usize>() {
-                            _search = Search::with_config(size_mb, stop_signal.clone());
+                            search = Search::with_config(size_mb, stop_signal.clone());
                         }
                     }
                 }
@@ -129,7 +129,7 @@ fn handle_position(parts: &[&str], position: &mut Position) {
         // Parse moves if present
         if parts.len() > 2 && parts[2] == "moves" {
             for i in 3..parts.len() {
-                if let Ok(mv) = move_from_string(parts[i]) {
+                if let Ok(mv) = move_from_string(parts[i], position.state.ep_square) {
                     let from_sq = mv.from();
                     // Check if there's actually a piece on the from square BEFORE making the move
                     if position.board.get_piece(from_sq).is_none() {
@@ -158,7 +158,7 @@ fn handle_position(parts: &[&str], position: &mut Position) {
             // Parse moves if present
             if let Some(moves_idx) = parts.iter().position(|&x| x == "moves") {
                 for i in (moves_idx + 1)..parts.len() {
-                    if let Ok(mv) = move_from_string(parts[i]) {
+                    if let Ok(mv) = move_from_string(parts[i], position.state.ep_square) {
                         let from_sq = mv.from();
                         // Check if there's actually a piece on the from square BEFORE making the move
                         if position.board.get_piece(from_sq).is_none() {
@@ -258,12 +258,18 @@ fn handle_go(
 
     // Adaptive depth based on time budget for bullet games
     let time_budget_ms = time_ms.unwrap_or(0);
-    if time_budget_ms > 0 && time_budget_ms < 200 {
-        // Bullet game: reduce depth to avoid time losses
-        depth = depth.min(4); // Cap at depth 4 for very fast games
+    if time_budget_ms > 0 && time_budget_ms < 50 {
+        // Ultra-fast bullet: extremely shallow search (depth 1 only)
+        depth = depth.min(1); // Depth 1 for <50ms budget
+    } else if time_budget_ms > 0 && time_budget_ms < 100 {
+        // Fast bullet: very shallow search
+        depth = depth.min(2); // Cap at depth 2 for <100ms per move
+    } else if time_budget_ms > 0 && time_budget_ms < 200 {
+        // Bullet game: shallow search
+        depth = depth.min(3); // Cap at depth 3 for very fast games
     } else if time_budget_ms > 0 && time_budget_ms < 500 {
         // Fast blitz: moderate depth
-        depth = depth.min(6);
+        depth = depth.min(5);
     }
 
     // Validate position before cloning (comprehensive check)
@@ -272,7 +278,9 @@ fn handle_go(
         eprintln!("{}", err);
         eprintln!("Position FEN: {}", position.to_fen());
         position.board.debug_print();
-        // Still continue - maybe we can recover
+        // Position is corrupted - return null move immediately
+        println!("bestmove 0000");
+        return;
     }
 
     // Also check board consistency
@@ -280,6 +288,9 @@ fn handle_go(
         eprintln!("ERROR: Invalid board state before search!");
         eprintln!("{}", err);
         position.board.debug_print();
+        // Board is corrupted - return null move immediately
+        println!("bestmove 0000");
+        return;
     }
 
     // Clone position for thread BEFORE search starts
@@ -288,7 +299,7 @@ fn handle_go(
 
     // Debug: Check if the cloned position is identical to the original
     if position_clone.state.hash != position.state.hash {
-        println!(
+        eprintln!(
             "WARNING: Position hash mismatch! Clone: {}, Original: {}",
             position_clone.state.hash, position.state.hash
         );
@@ -300,26 +311,27 @@ fn handle_go(
     // Clone stop signal for the search thread
     let stop_signal_for_search = stop_signal.clone();
 
+    // Move the configured search into the thread (TT configuration is preserved)
+    // Note: After this move, the main thread's search reference is invalidated
+    // It will be recreated on the next ucinewgame or setoption command
+    let mut search_to_move = std::mem::replace(search, Search::new());
+
     // Spawn search thread
     thread::spawn(move || {
-        let mut search = Search::with_stop_signal(stop_signal_for_search);
+        // Attach the stop signal to the existing search (preserves TT)
+        search_to_move.set_stop_signal(stop_signal_for_search);
 
-        let time_limit = if let Some(mt) = movetime {
-            Some(mt)
-        } else if let Some(_) = mate {
-            None // Use depth for mate search
-        } else if let Some(_n) = nodes {
-            // Search until node count reached (will be checked in loop)
-            None
-        } else {
-            time_ms
+        let time_limit = match (movetime, mate, nodes) {
+            (Some(mt), _, _) => Some(mt),
+            (_, Some(_), _) | (_, _, Some(_)) => None,
+            _ => time_ms,
         };
 
-        let search_depth = if mate.is_some() { mate.unwrap() } else { depth };
+        let search_depth = mate.unwrap_or(depth);
 
-        let (best_move, _score) = search.search(&position_clone, search_depth, time_limit);
+        let (best_move, _score) = search_to_move.search(&position_clone, search_depth, time_limit);
 
-        tx.send((best_move, search.nodes())).ok();
+        tx.send((best_move, search_to_move.nodes())).ok();
     });
 
     // Wait for result or stop signal
@@ -351,15 +363,16 @@ fn handle_go(
 
         // Stop the search
         stop_signal.store(true, std::sync::atomic::Ordering::Relaxed);
-    } else if let Some(n) = nodes {
-        // Search until node count reached
+    } else if nodes.is_some() {
+        // Search until node count reached (enforced internally)
+        // Note: The search thread sends only one result when complete
         loop {
             match rx.recv_timeout(Duration::from_millis(100)) {
-                Ok((mv, searched_nodes)) => {
-                    if searched_nodes >= n {
-                        best_move = mv;
-                        break;
-                    }
+                Ok((mv, _searched_nodes)) => {
+                    // Always accept the result when the search completes
+                    // The node limit is enforced inside the search itself
+                    best_move = mv;
+                    break;
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     if stop_signal.load(std::sync::atomic::Ordering::Relaxed) {
@@ -402,15 +415,6 @@ fn handle_go(
 
     // Validate the move before outputting
     if !best_move.is_null() {
-        // First check pseudo-legal (faster, catches most errors)
-        let is_pseudo_legal = MoveGen::is_pseudo_legal(
-            &position.board,
-            best_move,
-            position.state.side_to_move,
-            position.state.ep_square,
-            position.state.castling_rights,
-        );
-
         let legal_moves = MoveGen::generate_legal_moves_ep(
             &position.board,
             position.state.side_to_move,
@@ -418,12 +422,10 @@ fn handle_go(
             position.state.castling_rights,
         );
         let mut move_is_legal = false;
-        if is_pseudo_legal {
-            for i in 0..legal_moves.len() {
-                if legal_moves.get(i) == best_move {
-                    move_is_legal = true;
-                    break;
-                }
+        for i in 0..legal_moves.len() {
+            if legal_moves.get(i) == best_move {
+                move_is_legal = true;
+                break;
             }
         }
         if !move_is_legal {
@@ -495,23 +497,53 @@ fn handle_go(
                 // Try to find a move that's similar to the illegal one
                 // (same piece type, similar direction, etc.)
                 let illegal_from = best_move.from();
-                let _illegal_to = best_move.to();
+                let illegal_to = best_move.to();
 
+                // First try: same from and to squares (ideal)
                 for i in 0..legal_moves.len() {
                     let candidate = legal_moves.get(i);
-                    if candidate.from() == illegal_from {
-                        // Same starting square - this is a good fallback
+                    if candidate.from() == illegal_from && candidate.to() == illegal_to {
                         fallback_move = candidate;
                         println!(
-                            "info string Found fallback with same from square: {}",
+                            "info string Found fallback with same from/to: {}",
                             candidate
                         );
                         break;
                     }
                 }
 
+                // Second try: same to square (similar destination)
                 if fallback_move.is_null() {
-                    // No move with same from square, use first legal move
+                    for i in 0..legal_moves.len() {
+                        let candidate = legal_moves.get(i);
+                        if candidate.to() == illegal_to {
+                            fallback_move = candidate;
+                            println!(
+                                "info string Found fallback with same to square: {}",
+                                candidate
+                            );
+                            break;
+                        }
+                    }
+                }
+
+                // Third try: same from square (same piece)
+                if fallback_move.is_null() {
+                    for i in 0..legal_moves.len() {
+                        let candidate = legal_moves.get(i);
+                        if candidate.from() == illegal_from {
+                            fallback_move = candidate;
+                            println!(
+                                "info string Found fallback with same from square: {}",
+                                candidate
+                            );
+                            break;
+                        }
+                    }
+                }
+
+                // Fallback: first legal move
+                if fallback_move.is_null() {
                     fallback_move = legal_moves.get(0);
                     println!(
                         "info string Using first legal move as fallback: {}",
@@ -557,31 +589,48 @@ fn calculate_time_budget(
     };
 
     let moves_left = movestogo.unwrap_or_else(|| {
-        // Estimate remaining moves
+        // Estimate remaining moves, with minimum of 5 to avoid overly aggressive allocation
         let estimated_moves: u32 = 40;
-        estimated_moves.saturating_sub(fullmove_number)
+        estimated_moves.saturating_sub(fullmove_number).max(5)
     });
 
     // Very aggressive time allocation for bullet (1+0) games
-    // Use 1/3 to 1/5 of remaining time based on game phase
-    let time_fraction = if moves_left <= 10 {
-        3
-    } else if moves_left >= 30 {
-        5
+    // For bullet, use 1/10 to 1/20 of remaining time based on game phase
+    // This is extremely aggressive but necessary for 1+0
+    let is_bullet = my_time < 2000; // Less than 2 seconds = bullet
+    let time_fraction = if is_bullet {
+        // Bullet: use fixed fractions based on game phase
+        if moves_left <= 10 {
+            20
+        } else if moves_left >= 30 {
+            30
+        } else {
+            25
+        }
     } else {
-        4
+        // Non-bullet: use moves_left directly (remaining time / remaining moves)
+        // This avoids front-loading time and prevents time trouble
+        moves_left.max(1)
     };
 
-    let mut allocated = my_time / time_fraction;
+    let mut allocated = my_time / time_fraction as u64;
     allocated = allocated.saturating_add(my_inc);
 
-    // Keep at least 100ms and leave only 20ms buffer for very fast games
-    let allocated = allocated.max(100).min(my_time.saturating_sub(20));
+    // For bullet, use extremely small minimum and proportional buffer
+    allocated = if is_bullet {
+        // For bullet: minimum 10ms, with proportional buffer (1/4 to 200ms max)
+        // Ensure we don't underflow when subtracting buffer
+        let buffer = (my_time / 4).min(200);
+        let capped = my_time.saturating_sub(buffer).max(10);
+        allocated.max(10).min(capped)
+    } else {
+        allocated.max(100).min(my_time.saturating_sub(50))
+    };
 
     Some(allocated)
 }
 
-fn move_from_string(s: &str) -> Result<Move, String> {
+fn move_from_string(s: &str, ep_square: Option<chessy::utils::Square>) -> Result<Move, String> {
     if s.len() < 4 {
         return Err("Move string too short".to_string());
     }
@@ -594,21 +643,22 @@ fn move_from_string(s: &str) -> Result<Move, String> {
     // Detect castling moves in UCI format
     // Kingside: e1g1 (white), e8g8 (black)
     // Queenside: e1c1 (white), e8c8 (black)
-    // NOTE: UCI sends king destination (g1/g8/c1/c8), but we encode castling
-    // as "king captures rook" (h1/h8/a1/a8), so we need to convert
+    // Our encoding uses the king's destination directly
     let is_castle = (from == 4 && (to == 6 || to == 2)) ||   // White: e1 to g1 or c1
                     (from == 60 && (to == 62 || to == 58)); // Black: e8 to g8 or c8
 
     if is_castle {
-        // Convert UCI destination to internal encoding (rook square)
-        let rook_sq = match (from, to) {
-            (4, 6) => 7,    // White kingside: king goes to g1(6), but we encode as capturing h1(7)
-            (4, 2) => 0,    // White queenside: king goes to c1(2), but we encode as capturing a1(0)
-            (60, 62) => 63, // Black kingside: king goes to g8(62), but we encode as capturing h8(63)
-            (60, 58) => 56, // Black queenside: king goes to c8(58), but we encode as capturing a8(56)
-            _ => to,        // Should not reach here
-        };
-        return Ok(Move::castle(from, rook_sq));
+        return Ok(Move::castle(from, to));
+    }
+
+    // Detect en passant
+    // En passant: diagonal pawn move to the ep_square
+    let is_pawn_move = matches!(from % 8, 0 | 7); // Pawns are on ranks 1 and 6 (indices 8-15 and 48-55)
+    let file_diff = (from as i8 - to as i8).abs() == 1; // Diagonal move
+    if let Some(ep) = ep_square {
+        if is_pawn_move && file_diff && to == ep {
+            return Ok(Move::en_passant(from, to));
+        }
     }
 
     // Handle promotion

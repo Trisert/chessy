@@ -2,8 +2,6 @@ use crate::board::Board;
 use crate::piece::{Color, Piece};
 use crate::r#move::Move;
 use crate::utils::Square;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 
 /// Information needed to undo a move
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -254,7 +252,8 @@ impl Position {
         }
 
         // Update halfmove clock
-        let is_capture = self.board.get_piece(to).is_some();
+        // Castling is encoded as "king captures rook" - exclude it from capture detection
+        let is_capture = !mv.is_castle() && self.board.get_piece(to).is_some();
         let is_pawn_move = piece.piece_type == crate::piece::PieceType::Pawn;
 
         if is_capture || is_pawn_move {
@@ -268,20 +267,91 @@ impl Position {
             self.state.fullmove_number += 1;
         }
 
+        // === Incremental hash updates (MUCH faster than recomputing!) ===
+        // Save state before modifications
+        let old_rights = self.state.castling_rights;
+        let old_ep = self.state.ep_square;
+
+        // Remove piece from old square
+        self.update_hash_piece(piece, from);
+
+        // Remove captured piece (if any) from destination
+        // Need to check for en passant capture (different square)
+        let captured = if mv.is_en_passant() {
+            // En passant captures the pawn on a different square
+            let ep_capture_sq = if color == Color::White {
+                to - 8
+            } else {
+                to + 8
+            };
+            self.board.get_piece(ep_capture_sq)
+        } else {
+            // Normal capture
+            self.board.get_piece(to)
+        };
+
+        if let Some(captured_piece) = captured {
+            let capture_sq = if mv.is_en_passant() {
+                if color == Color::White {
+                    to - 8
+                } else {
+                    to + 8
+                }
+            } else {
+                to
+            };
+            self.update_hash_piece(captured_piece, capture_sq);
+        }
+
         // Make the move on the board
         self.make_move_on_board(mv, color, piece);
 
-        // Update side to move
+        // Add piece to new square (or promoted piece)
+        if mv.is_promotion() {
+            use crate::r#move::PromotionType;
+            use crate::piece::PieceType;
+            if let Some(promo_type) = mv.promotion_type() {
+                let promoted_piece = Piece::new(
+                    color,
+                    match promo_type {
+                        PromotionType::Knight => PieceType::Knight,
+                        PromotionType::Bishop => PieceType::Bishop,
+                        PromotionType::Rook => PieceType::Rook,
+                        PromotionType::Queen => PieceType::Queen,
+                    },
+                );
+                self.update_hash_piece(promoted_piece, to);
+            }
+        } else {
+            // Check if it's castling (encoded as king captures rook)
+            if mv.is_castle() {
+                // Castling: we need to hash the rook move too
+                let rook_from = to;
+                let rook_to = mv.castle_rook_destination();
+                if let Some(rook) = self.board.get_piece(rook_to) {
+                    self.update_hash_piece(rook, rook_from); // Remove rook from old position
+                    self.update_hash_piece(rook, rook_to);   // Add rook to new position
+                }
+                // King's new position
+                let king_dest = mv.castle_king_destination();
+                self.update_hash_piece(piece, king_dest);
+            } else {
+                // Normal move - add piece to destination
+                self.update_hash_piece(piece, to);
+            }
+        }
+
+        // Update side to move (flip)
         self.state.side_to_move = color.flip();
+        self.update_hash_side_to_move();
 
         // Update castling rights
         self.update_castling_rights(from, to);
+        self.update_hash_castling(old_rights, self.state.castling_rights);
 
         // Update en passant square
         self.update_ep_square(mv, color);
-
-        // Recompute hash
-        self.state.hash = self.compute_hash();
+        self.update_hash_en_passant(old_ep, self.state.ep_square);
     }
 
     /// Undo a move
@@ -323,15 +393,40 @@ impl Position {
             return;
         }
 
+        // Save state for incremental hash updates
+        let old_rights = self.state.castling_rights;
+        let old_ep = self.state.ep_square;
+
+        // Determine captured piece (handle en passant and castling specially)
+        let captured = if mv.is_castle() {
+            // Castling is encoded as "king captures rook" - no actual capture
+            None
+        } else if mv.is_en_passant() {
+            let ep_capture_sq = if color == Color::White {
+                to - 8
+            } else {
+                to + 8
+            };
+            self.board.get_piece(ep_capture_sq)
+        } else {
+            self.board.get_piece(to)
+        };
+
         // Collect undo info BEFORE making any changes
-        let captured = self.board.get_piece(to);
+        let ep_captured_sq = if mv.is_en_passant() {
+            let ep_sq = if color == Color::White { to - 8 } else { to + 8 };
+            Some(ep_sq)
+        } else {
+            None
+        };
+
         let undo_info = UndoInfo {
             mv,
             captured,
             castling_rights: self.state.castling_rights,
             ep_square: self.state.ep_square,
             halfmove_clock: self.state.halfmove_clock,
-            ep_captured_sq: None,
+            ep_captured_sq,
             promoted_piece: None,
             fullmove_number: self.state.fullmove_number,
             hash: self.state.hash,
@@ -352,10 +447,24 @@ impl Position {
             self.state.fullmove_number += 1;
         }
 
-        // Handle castling (king captures rook encoding)
+        // === Incremental hash updates ===
+        // Remove piece from old square
+        self.update_hash_piece(piece, from);
+
+        // Handle castling (encoded with king's destination)
         if mv.is_castle() {
             let king_dest = mv.castle_king_destination();
-            let rook_from = to;
+            // Calculate rook's original square based on king's destination
+            let rook_from = match (from, king_dest) {
+                (4, 6) => 7,    // White kingside: e1->g1, rook on h1
+                (4, 2) => 0,    // White queenside: e1->c1, rook on a1
+                (60, 62) => 63, // Black kingside: e8->g8, rook on h8
+                (60, 58) => 56, // Black queenside: e8->c8, rook on a8
+                _ => {
+                    eprintln!("ERROR: Invalid castling move from={} to={}", from, king_dest);
+                    return;
+                }
+            };
             let rook_dest = mv.castle_rook_destination();
 
             // Move the king
@@ -366,13 +475,22 @@ impl Position {
             if let Some(rook) = self.board.get_piece(rook_from) {
                 self.board.remove_piece(rook, rook_from);
                 self.board.set_piece(rook, rook_dest);
+
+                // Hash rook move
+                self.update_hash_piece(rook, rook_from);
+                self.update_hash_piece(rook, rook_dest);
             }
 
-            // Update castling rights
-            self.update_castling_rights(from, to);
+            // Hash king to new position
+            self.update_hash_piece(piece, king_dest);
+
+            // Update side to move, castling, EP
             self.state.side_to_move = color.flip();
+            self.update_hash_side_to_move();
+            self.update_castling_rights(from, to);
+            self.update_hash_castling(old_rights, self.state.castling_rights);
             self.state.ep_square = None;
-            self.state.hash = self.compute_hash();
+            self.update_hash_en_passant(old_ep, None);
 
             self.undo_stack.push(undo_info);
             return;
@@ -383,27 +501,30 @@ impl Position {
             self.board.remove_piece(piece, from);
             self.board.set_piece(piece, to);
 
-            // Remove the captured pawn
             let captured_pawn_sq = if color == Color::White {
                 to - 8
             } else {
                 to + 8
             };
 
-            if let Some(captured_pawn) = self.board.get_piece(captured_pawn_sq) {
+            if let Some(captured_pawn) = captured {
                 self.board.remove_piece(captured_pawn, captured_pawn_sq);
+                // Hash the captured pawn removal
+                self.update_hash_piece(captured_pawn, captured_pawn_sq);
             }
 
-            // Update castling rights
-            self.update_castling_rights(from, to);
-            self.state.side_to_move = color.flip();
-            self.state.ep_square = None;
+            // Hash pawn to new position
+            self.update_hash_piece(piece, to);
 
-            // Update undo info with EP capture square
-            let mut undo_with_ep = undo_info;
-            undo_with_ep.ep_captured_sq = Some(captured_pawn_sq);
-            self.undo_stack.push(undo_with_ep);
-            self.state.hash = self.compute_hash();
+            // Update side to move, castling, EP
+            self.state.side_to_move = color.flip();
+            self.update_hash_side_to_move();
+            self.update_castling_rights(from, to);
+            self.update_hash_castling(old_rights, self.state.castling_rights);
+            self.state.ep_square = None;
+            self.update_hash_en_passant(old_ep, None);
+
+            self.undo_stack.push(undo_info);
             return;
         }
 
@@ -429,16 +550,22 @@ impl Position {
         // Make the move on the board
         self.board.remove_piece(piece, from);
 
-        // Handle captures
+        // Handle captures (but NOT castling - that's handled above)
         if let Some(captured_piece) = captured {
             self.board.remove_piece(captured_piece, to);
+            // Hash captured piece removal
+            self.update_hash_piece(captured_piece, to);
         }
 
         // Place the piece (promoted or normal)
         if let Some(promo) = promoted_piece {
             self.board.set_piece(promo, to);
+            // Hash promoted piece
+            self.update_hash_piece(promo, to);
         } else {
             self.board.set_piece(piece, to);
+            // Hash piece to new position
+            self.update_hash_piece(piece, to);
         }
 
         // Update castling rights
@@ -449,11 +576,13 @@ impl Position {
 
         // Update side to move
         self.state.side_to_move = color.flip();
+        self.update_hash_side_to_move();
 
-        // Update hash
-        self.state.hash = self.compute_hash();
+        // Update castling and EP hashes
+        self.update_hash_castling(old_rights, self.state.castling_rights);
+        self.update_hash_en_passant(old_ep, self.state.ep_square);
 
-        // Store undo info
+        // Store undo info with promoted piece
         let mut undo_final = undo_info;
         undo_final.promoted_piece = promoted_piece;
         self.undo_stack.push(undo_final);
@@ -482,7 +611,17 @@ impl Position {
         // Handle castling undo
         if mv.is_castle() {
             let king_dest = mv.castle_king_destination();
-            let rook_from = to;
+            // Calculate rook's original square based on king's destination
+            let rook_from = match (from, king_dest) {
+                (4, 6) => 7,    // White kingside: e1->g1, rook on h1
+                (4, 2) => 0,    // White queenside: e1->c1, rook on a1
+                (60, 62) => 63, // Black kingside: e8->g8, rook on h8
+                (60, 58) => 56, // Black queenside: e8->c8, rook on a8
+                _ => {
+                    eprintln!("ERROR: Invalid castling move from={} to={}", from, king_dest);
+                    return;
+                }
+            };
             let rook_dest = mv.castle_rook_destination();
 
             // Get the king and rook
@@ -542,8 +681,8 @@ impl Position {
             // Remove promoted piece
             self.board.remove_piece(promoted, to);
 
-            // Restore original pawn
-            let original_piece = Piece::new(color.flip(), PieceType::Pawn);
+            // Restore original pawn (with the mover's color, not flipped!)
+            let original_piece = Piece::new(color, PieceType::Pawn);
             self.board.set_piece(original_piece, from);
 
             // Restore captured piece if any
@@ -679,11 +818,21 @@ impl Position {
         let to = mv.to();
 
         // Handle castling
-        // NOTE: Castling is encoded as "king captures friendly rook"
-        // So 'to' is the ROOK'S square, not the king's destination
+        // NOTE: Castling is encoded with the king's destination
+        // 'to' is the KING'S destination, we need to find the rook's original square
         if mv.is_castle() {
             let king_dest = mv.castle_king_destination();
-            let rook_from = to; // The 'to' square in a castling move is the rook's position
+            // Calculate rook's original square based on king's destination
+            let rook_from = match (from, king_dest) {
+                (4, 6) => 7,    // White kingside: e1->g1, rook on h1
+                (4, 2) => 0,    // White queenside: e1->c1, rook on a1
+                (60, 62) => 63, // Black kingside: e8->g8, rook on h8
+                (60, 58) => 56, // Black queenside: e8->c8, rook on a8
+                _ => {
+                    eprintln!("ERROR: Invalid castling move from={} to={}", from, king_dest);
+                    return;
+                }
+            };
             let rook_dest = mv.castle_rook_destination();
 
             // Move the king
@@ -757,7 +906,7 @@ impl Position {
     }
 
     /// Update castling rights after a move
-    fn update_castling_rights(&mut self, from: Square, _to: Square) {
+    fn update_castling_rights(&mut self, from: Square, to: Square) {
         const WHITE_KINGSIDE: u8 = 0x01;
         const WHITE_QUEENSIDE: u8 = 0x02;
         const BLACK_KINGSIDE: u8 = 0x04;
@@ -773,7 +922,7 @@ impl Position {
             self.state.castling_rights &= !(BLACK_KINGSIDE | BLACK_QUEENSIDE);
         }
 
-        // Rook moves
+        // Rook moves from home square
         if from == 0 {
             self.state.castling_rights &= !WHITE_QUEENSIDE;
         }
@@ -784,6 +933,20 @@ impl Position {
             self.state.castling_rights &= !BLACK_QUEENSIDE;
         }
         if from == 63 {
+            self.state.castling_rights &= !BLACK_KINGSIDE;
+        }
+
+        // Rook captures on home square
+        if to == 0 {
+            self.state.castling_rights &= !WHITE_QUEENSIDE;
+        }
+        if to == 7 {
+            self.state.castling_rights &= !WHITE_KINGSIDE;
+        }
+        if to == 56 {
+            self.state.castling_rights &= !BLACK_QUEENSIDE;
+        }
+        if to == 63 {
             self.state.castling_rights &= !BLACK_KINGSIDE;
         }
     }
@@ -816,27 +979,65 @@ impl Position {
         self.state.ep_square = None;
     }
 
-    /// Compute Zobrist hash (simplified version)
+    /// Compute Zobrist hash (incremental version - only used for initialization)
     fn compute_hash(&self) -> u64 {
-        let mut hasher = DefaultHasher::new();
+        use crate::zobrist::Zobrist;
 
-        // Hash board state
+        let mut hash = 0u64;
+
+        // Hash pieces
         for sq in 0..64 {
             if let Some(piece) = self.board.get_piece(sq) {
-                piece.hash_to(sq, &mut hasher);
+                hash ^= Zobrist::piece(piece, sq);
             }
         }
 
         // Hash side to move
-        self.state.side_to_move.hash(&mut hasher);
+        if self.state.side_to_move == Color::Black {
+            hash ^= Zobrist::side();
+        }
 
         // Hash castling rights
-        self.state.castling_rights.hash(&mut hasher);
+        hash ^= Zobrist::castling(self.state.castling_rights);
 
-        // Hash EP square
-        self.state.ep_square.hash(&mut hasher);
+        // Hash en passant square
+        if let Some(ep) = self.state.ep_square {
+            hash ^= Zobrist::en_passant(ep);
+        }
 
-        hasher.finish()
+        hash
+    }
+
+    /// Update hash incrementally when a piece is added/removed/moved
+    fn update_hash_piece(&mut self, piece: Piece, square: Square) {
+        use crate::zobrist::Zobrist;
+        self.state.hash ^= Zobrist::piece(piece, square);
+    }
+
+    /// Update hash incrementally for side to move change
+    fn update_hash_side_to_move(&mut self) {
+        use crate::zobrist::Zobrist;
+        self.state.hash ^= Zobrist::side();
+    }
+
+    /// Update hash incrementally for castling rights change
+    fn update_hash_castling(&mut self, old_rights: u8, new_rights: u8) {
+        use crate::zobrist::Zobrist;
+        // Remove old castling rights
+        self.state.hash ^= Zobrist::castling(old_rights);
+        // Add new castling rights
+        self.state.hash ^= Zobrist::castling(new_rights);
+    }
+
+    /// Update hash incrementally for en passant square change
+    fn update_hash_en_passant(&mut self, old_ep: Option<Square>, new_ep: Option<Square>) {
+        use crate::zobrist::Zobrist;
+        if let Some(old_sq) = old_ep {
+            self.state.hash ^= Zobrist::en_passant(old_sq);
+        }
+        if let Some(new_sq) = new_ep {
+            self.state.hash ^= Zobrist::en_passant(new_sq);
+        }
     }
 
     /// Convert position to FEN string
@@ -1026,17 +1227,6 @@ impl Position {
         } else {
             Err(errors.join("; "))
         }
-    }
-}
-
-/// Extension trait for piece hashing
-trait Hashable {
-    fn hash_to(&self, sq: Square, hasher: &mut DefaultHasher);
-}
-
-impl Hashable for crate::piece::Piece {
-    fn hash_to(&self, sq: Square, hasher: &mut DefaultHasher) {
-        (self.color, self.piece_type, sq).hash(hasher);
     }
 }
 
