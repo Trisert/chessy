@@ -111,7 +111,7 @@ impl Move {
     /// - Black kingside: e8 (60) -> g8 (62)
     /// - Black queenside: e8 (60) -> c8 (58)
     #[inline]
-    pub const fn castle_king_destination(self) -> Square {
+    pub fn castle_king_destination(self) -> Square {
         debug_assert!(self.is_castle(), "castle_king_destination called on non-castle move");
         // The encoding uses the king's final position as to()
         self.to()
@@ -126,7 +126,7 @@ impl Move {
     /// - Black kingside: rook moves h8 (63) -> f8 (61)
     /// - Black queenside: rook moves a8 (56) -> d8 (59)
     #[inline]
-    pub const fn castle_rook_destination(self) -> Square {
+    pub fn castle_rook_destination(self) -> Square {
         debug_assert!(self.is_castle(), "castle_rook_destination called on non-castle move");
         let from = self.from();
         let to = self.to();
@@ -153,8 +153,7 @@ impl Move {
                 59 // d8
             }
         } else {
-            debug_assert!(false, "unexpected king origin for castle");
-            to // Fallback for non-castling moves (only in release builds)
+            unreachable!("unexpected king origin for castle: from={}", from);
         }
     }
 }

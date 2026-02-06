@@ -341,8 +341,11 @@ impl Search {
         }
 
         // Store in transposition table
-        self.tt
-            .store(position.state.hash, best_move, alpha, depth as u8, tt_flag);
+        // Only store if we have a valid best_move, unless it's an upper bound (where null move is OK)
+        if !best_move.is_null() || tt_flag == TTFlag::Upper {
+            self.tt
+                .store(position.state.hash, best_move, alpha, depth as u8, tt_flag);
+        }
 
         // Final validation: ensure best_move is actually legal
         if !best_move.is_null() {
