@@ -309,6 +309,11 @@ impl Search {
             // each move must complete very quickly. The overhead is negligible compared
             // to the search work done at each node.
             if self.should_stop() {
+                // If we haven't found a best_move yet, use the first move as fallback
+                // This ensures we never return Move::null() when legal moves exist
+                if best_move.is_null() && moves.len() > 0 {
+                    best_move = moves.get(0);
+                }
                 break;
             }
 
@@ -377,6 +382,12 @@ impl Search {
                     eprintln!("Fallback: No legal moves available");
                 }
             }
+        }
+
+        // Final fallback: if best_move is still null but we have legal moves,
+        // use the first one (this can happen if search was aborted before finding any move)
+        if best_move.is_null() && moves.len() > 0 {
+            best_move = moves.get(0);
         }
 
         (best_move, alpha)

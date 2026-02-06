@@ -413,6 +413,21 @@ fn handle_go(
         best_move = mv;
     }
 
+    // If no move was found (search timed out before sending result),
+    // generate a fallback legal move
+    if best_move.is_null() {
+        let legal_moves = MoveGen::generate_legal_moves_ep(
+            &position.board,
+            position.state.side_to_move,
+            position.state.ep_square,
+            position.state.castling_rights,
+        );
+        if legal_moves.len() > 0 {
+            eprintln!("WARNING: Search returned null move, using first legal move as fallback");
+            best_move = legal_moves.get(0);
+        }
+    }
+
     // Validate the move before outputting
     if !best_move.is_null() {
         let legal_moves = MoveGen::generate_legal_moves_ep(
