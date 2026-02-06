@@ -3,19 +3,34 @@ use crate::utils::Square;
 use std::sync::LazyLock;
 
 /// Zobrist hashing tables for incremental position hashing
+///
+/// # Design
+/// This struct uses fixed-size arrays for optimal performance and cache locality.
+/// All fields are private - access is provided through associated functions on the
+/// global ZOBRIST instance (e.g., `Zobrist::piece(...)` rather than `ZOBRIST.piece(...)`).
+/// This design ensures the global tables remain immutable and accessible from anywhere.
 pub struct Zobrist {
     /// Piece squares: [piece_type][color][square]
-    pub pieces: Vec<Vec<Vec<u64>>>,
+    pieces: [[[u64; 64]; 2]; 6],
     /// Castling rights: [4] (KQkq)
-    pub castling: [u64; 4],
+    castling: [u64; 4],
     /// En passant square: [64]
-    pub en_passant: [u64; 64],
+    en_passant: [u64; 64],
     /// Side to move
-    pub side_to_move: u64,
+    side_to_move: u64,
 }
 
-/// Global Zobrist tables
-pub static ZOBRIST: LazyLock<Zobrist> = LazyLock::new(|| Zobrist::new());
+/// Global Zobrist tables (initialized once at first access)
+///
+/// # Usage
+/// Access the hash values through the associated functions:
+/// - `Zobrist::piece(piece, square)` - hash for a piece on a square
+/// - `Zobrist::castling(rights)` - hash for castling rights
+/// - `Zobrist::en_passant(square)` - hash for en passant square
+/// - `Zobrist::side()` - hash for side to move
+///
+/// These functions access the global ZOBRIST instance internally.
+pub static ZOBRIST: LazyLock<Zobrist> = LazyLock::new(Zobrist::new);
 
 impl Zobrist {
     /// Create new Zobrist tables with random 64-bit numbers
@@ -25,18 +40,14 @@ impl Zobrist {
 
         let mut rng = FIXED_ZOBRIST_SEED;
 
-        // Initialize 3D array: [piece_type][color][square]
-        let mut pieces: Vec<Vec<Vec<u64>>> = Vec::new();
-        for _pt in 0..6 {
-            let mut color_array: Vec<Vec<u64>> = Vec::new();
-            for _color in 0..2 {
-                let mut square_array: Vec<u64> = Vec::new();
-                for _sq in 0..64 {
-                    square_array.push(random_u64(&mut rng));
+        // Initialize fixed-size arrays
+        let mut pieces = [[[0u64; 64]; 2]; 6];
+        for pt in 0..6 {
+            for color in 0..2 {
+                for sq in 0..64 {
+                    pieces[pt][color][sq] = random_u64(&mut rng);
                 }
-                color_array.push(square_array);
             }
-            pieces.push(color_array);
         }
 
         let mut castling = [0u64; 4];

@@ -278,7 +278,9 @@ fn handle_go(
         eprintln!("{}", err);
         eprintln!("Position FEN: {}", position.to_fen());
         position.board.debug_print();
-        // Still continue - maybe we can recover
+        // Position is corrupted - return null move immediately
+        println!("bestmove 0000");
+        return;
     }
 
     // Also check board consistency
@@ -286,6 +288,9 @@ fn handle_go(
         eprintln!("ERROR: Invalid board state before search!");
         eprintln!("{}", err);
         position.board.debug_print();
+        // Board is corrupted - return null move immediately
+        println!("bestmove 0000");
+        return;
     }
 
     // Clone position for thread BEFORE search starts
@@ -496,23 +501,53 @@ fn handle_go(
                 // Try to find a move that's similar to the illegal one
                 // (same piece type, similar direction, etc.)
                 let illegal_from = best_move.from();
-                let _illegal_to = best_move.to();
+                let illegal_to = best_move.to();
 
+                // First try: same from and to squares (ideal)
                 for i in 0..legal_moves.len() {
                     let candidate = legal_moves.get(i);
-                    if candidate.from() == illegal_from {
-                        // Same starting square - this is a good fallback
+                    if candidate.from() == illegal_from && candidate.to() == illegal_to {
                         fallback_move = candidate;
                         println!(
-                            "info string Found fallback with same from square: {}",
+                            "info string Found fallback with same from/to: {}",
                             candidate
                         );
                         break;
                     }
                 }
 
+                // Second try: same to square (similar destination)
                 if fallback_move.is_null() {
-                    // No move with same from square, use first legal move
+                    for i in 0..legal_moves.len() {
+                        let candidate = legal_moves.get(i);
+                        if candidate.to() == illegal_to {
+                            fallback_move = candidate;
+                            println!(
+                                "info string Found fallback with same to square: {}",
+                                candidate
+                            );
+                            break;
+                        }
+                    }
+                }
+
+                // Third try: same from square (same piece)
+                if fallback_move.is_null() {
+                    for i in 0..legal_moves.len() {
+                        let candidate = legal_moves.get(i);
+                        if candidate.from() == illegal_from {
+                            fallback_move = candidate;
+                            println!(
+                                "info string Found fallback with same from square: {}",
+                                candidate
+                            );
+                            break;
+                        }
+                    }
+                }
+
+                // Fallback: first legal move
+                if fallback_move.is_null() {
                     fallback_move = legal_moves.get(0);
                     println!(
                         "info string Using first legal move as fallback: {}",

@@ -15,3 +15,4 @@ cutechess-cli
 test_king
 test_king.cperf.data*
 perf.data*
+*.data

@@ -19,7 +19,8 @@ impl Move {
     /// Create a promotion move
     #[inline]
     pub fn promotion(from: Square, to: Square, promotion: PromotionType) -> Self {
-        Move((from as u16) | ((to as u16) << 6) | ((promotion as u16) << 12) | (1 << 15))
+        // Add 4 to promotion type to distinguish from en passant (1) and castle (2)
+        Move((from as u16) | ((to as u16) << 6) | (((promotion as u16) + 4) << 12) | (1 << 15))
     }
 
     /// Create an en passant move
@@ -76,7 +77,8 @@ impl Move {
     #[inline]
     pub const fn promotion_type(self) -> Option<PromotionType> {
         if self.is_promotion() {
-            Some(match (self.0 >> 12) & 0x3 {
+            // Subtract 4 to get the actual promotion type (0-3)
+            Some(match ((self.0 >> 12) & 0x7) - 4 {
                 0 => PromotionType::Knight,
                 1 => PromotionType::Bishop,
                 2 => PromotionType::Rook,
@@ -101,58 +103,53 @@ impl Move {
     }
 
     /// Get king's destination square for castling
-    /// Castling is encoded as "king captures rook", so we compute
-    /// where the king actually ends up
+    ///
+    /// # Encoding convention
+    /// Castling moves are encoded with `to()` as the king's final destination square:
+    /// - White kingside: e1 (4) -> g1 (6)
+    /// - White queenside: e1 (4) -> c1 (2)
+    /// - Black kingside: e8 (60) -> g8 (62)
+    /// - Black queenside: e8 (60) -> c8 (58)
     #[inline]
     pub const fn castle_king_destination(self) -> Square {
-        let from = self.from();
-        // White castling
-        if from == 4 {
-            // e1 -> g1 (kingside) or c1 (queenside)
-            if self.to() == 7 {
-                6 // g1
-            } else {
-                2 // c1
-            }
-        }
-        // Black castling
-        else if from == 60 {
-            // e8 -> g8 (kingside) or c8 (queenside)
-            if self.to() == 63 {
-                62 // g8
-            } else {
-                58 // c8
-            }
-        } else {
-            from // Should not happen for castling moves
-        }
+        debug_assert!(self.is_castle(), "castle_king_destination called on non-castle move");
+        // The encoding uses the king's final position as to()
+        self.to()
     }
 
     /// Get rook's destination square for castling
-    /// Castling is encoded as "king captures rook", so we compute
-    /// where the rook actually ends up
+    ///
+    /// # Encoding convention
+    /// Castling moves are encoded with `to()` as the king's final destination square:
+    /// - White kingside: rook moves h1 (7) -> f1 (5)
+    /// - White queenside: rook moves a1 (0) -> d1 (3)
+    /// - Black kingside: rook moves h8 (63) -> f8 (61)
+    /// - Black queenside: rook moves a8 (56) -> d8 (59)
     #[inline]
     pub const fn castle_rook_destination(self) -> Square {
+        debug_assert!(self.is_castle(), "castle_rook_destination called on non-castle move");
         let from = self.from();
         // White castling
         if from == 4 {
-            // e1 castling
-            if self.to() == 7 {
-                5 // h1 -> f1
+            // e1 -> g1 (kingside) rook h1->f1
+            // e1 -> c1 (queenside) rook a1->d1
+            if self.to() == 6 {
+                5 // f1
             } else {
-                3 // a1 -> d1
+                3 // d1
             }
         }
         // Black castling
         else if from == 60 {
-            // e8 castling
-            if self.to() == 63 {
-                61 // h8 -> f8
+            // e8 -> g8 (kingside) rook h8->f8
+            // e8 -> c8 (queenside) rook a8->d8
+            if self.to() == 62 {
+                61 // f8
             } else {
-                59 // a8 -> d8
+                59 // d8
             }
         } else {
-            self.to() // Should not happen for castling moves
+            self.to() // Fallback for non-castling moves
         }
     }
 }
@@ -254,10 +251,46 @@ mod tests {
         let mv = Move::new(12, 28); // e2e4
         assert_eq!(mv.to_string(), "e2e4");
 
-        let mv = Move::promotion(12, 20, PromotionType::Queen); // e7e8q
-        assert_eq!(mv.to_string(), "e7e8q");
+        let mv = Move::promotion(12, 20, PromotionType::Queen); // e2e3q
+        assert_eq!(mv.to_string(), "e2e3q");
 
         let mv = Move::null();
         assert_eq!(mv.to_string(), "0000");
+    }
+
+    #[test]
+    fn test_castle_white_kingside() {
+        let mv = Move::castle(4, 6); // e1g1 (kingside castle)
+        assert_eq!(mv.from(), 4); // e1
+        assert_eq!(mv.to(), 6); // g1
+        assert_eq!(mv.castle_king_destination(), 6); // King ends on g1
+        assert_eq!(mv.castle_rook_destination(), 5); // Rook ends on f1
+    }
+
+    #[test]
+    fn test_castle_white_queenside() {
+        let mv = Move::castle(4, 2); // e1c1 (queenside castle)
+        assert_eq!(mv.from(), 4); // e1
+        assert_eq!(mv.to(), 2); // c1
+        assert_eq!(mv.castle_king_destination(), 2); // King ends on c1
+        assert_eq!(mv.castle_rook_destination(), 3); // Rook ends on d1
+    }
+
+    #[test]
+    fn test_castle_black_kingside() {
+        let mv = Move::castle(60, 62); // e8g8 (kingside castle)
+        assert_eq!(mv.from(), 60); // e8
+        assert_eq!(mv.to(), 62); // g8
+        assert_eq!(mv.castle_king_destination(), 62); // King ends on g8
+        assert_eq!(mv.castle_rook_destination(), 61); // Rook ends on f8
+    }
+
+    #[test]
+    fn test_castle_black_queenside() {
+        let mv = Move::castle(60, 58); // e8c8 (queenside castle)
+        assert_eq!(mv.from(), 60); // e8
+        assert_eq!(mv.to(), 58); // c8
+        assert_eq!(mv.castle_king_destination(), 58); // King ends on c8
+        assert_eq!(mv.castle_rook_destination(), 59); // Rook ends on d8
     }
 }
