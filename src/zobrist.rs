@@ -1,0 +1,114 @@
+use crate::piece::{Color, Piece, PieceType};
+use crate::utils::Square;
+use std::sync::LazyLock;
+
+/// Zobrist hashing tables for incremental position hashing
+pub struct Zobrist {
+    /// Piece squares: [piece_type][color][square]
+    pub pieces: Vec<Vec<Vec<u64>>>,
+    /// Castling rights: [4] (KQkq)
+    pub castling: [u64; 4],
+    /// En passant square: [64]
+    pub en_passant: [u64; 64],
+    /// Side to move
+    pub side_to_move: u64,
+}
+
+/// Global Zobrist tables
+pub static ZOBRIST: LazyLock<Zobrist> = LazyLock::new(|| Zobrist::new());
+
+impl Zobrist {
+    /// Create new Zobrist tables with random 64-bit numbers
+    fn new() -> Self {
+        use std::time::SystemTime;
+
+        let seed = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+
+        let mut rng = seed;
+
+        // Initialize 3D array: [piece_type][color][square]
+        let mut pieces: Vec<Vec<Vec<u64>>> = Vec::new();
+        for _pt in 0..6 {
+            let mut color_array: Vec<Vec<u64>> = Vec::new();
+            for _color in 0..2 {
+                let mut square_array: Vec<u64> = Vec::new();
+                for _sq in 0..64 {
+                    square_array.push(random_u64(&mut rng));
+                }
+                color_array.push(square_array);
+            }
+            pieces.push(color_array);
+        }
+
+        let mut castling = [0u64; 4];
+        for i in 0..4 {
+            castling[i] = random_u64(&mut rng);
+        }
+
+        let mut en_passant = [0u64; 64];
+        for sq in 0..64 {
+            en_passant[sq] = random_u64(&mut rng);
+        }
+
+        let side_to_move = random_u64(&mut rng);
+
+        Zobrist {
+            pieces,
+            castling,
+            en_passant,
+            side_to_move,
+        }
+    }
+
+    /// Get hash for a piece on a square
+    #[inline]
+    pub fn piece(piece: Piece, square: Square) -> u64 {
+        let pt = piece.piece_type as usize;
+        let c = piece.color as usize;
+        ZOBRIST.pieces[pt][c][square as usize]
+    }
+
+    /// Get hash for castling rights
+    #[inline]
+    pub fn castling(rights: u8) -> u64 {
+        let mut hash = 0;
+        if rights & 0x01 != 0 {
+            hash ^= ZOBRIST.castling[0]; // K
+        }
+        if rights & 0x02 != 0 {
+            hash ^= ZOBRIST.castling[1]; // Q
+        }
+        if rights & 0x04 != 0 {
+            hash ^= ZOBRIST.castling[2]; // k
+        }
+        if rights & 0x08 != 0 {
+            hash ^= ZOBRIST.castling[3]; // q
+        }
+        hash
+    }
+
+    /// Get hash for en passant square
+    #[inline]
+    pub fn en_passant(square: Square) -> u64 {
+        ZOBRIST.en_passant[square as usize]
+    }
+
+    /// Get hash for side to move
+    #[inline]
+    pub fn side() -> u64 {
+        ZOBRIST.side_to_move
+    }
+}
+
+/// Simple random number generator (xorshift64*)
+fn random_u64(state: &mut u64) -> u64 {
+    *state ^= *state >> 12;
+    *state ^= *state << 25;
+    *state ^= *state >> 27;
+    let result = state.wrapping_mul(2685821657736338717);
+    *state = state.wrapping_add(1);
+    result
+}
