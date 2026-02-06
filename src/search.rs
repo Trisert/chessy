@@ -6,12 +6,15 @@ use crate::r#move::Move;
 use crate::transposition::{TTFlag, TranspositionTable};
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Search engine
 pub struct Search {
-    /// Flag to stop the search
+    /// Flag to stop the search (internal)
     stop: AtomicBool,
+    /// External stop signal (shared with main thread)
+    external_stop: Option<Arc<AtomicBool>>,
     /// Nodes searched
     nodes: AtomicU64,
     /// Search start time (wrapped for interior mutability)
@@ -27,6 +30,7 @@ impl Search {
     pub fn new() -> Self {
         Search {
             stop: AtomicBool::new(false),
+            external_stop: None,
             nodes: AtomicU64::new(0),
             start_time: UnsafeCell::new(Instant::now()),
             time_limit: UnsafeCell::new(None),
@@ -34,10 +38,35 @@ impl Search {
         }
     }
 
+    /// Create a new search with external stop signal
+    pub fn with_stop_signal(external_stop: Arc<AtomicBool>) -> Self {
+        Search {
+            stop: AtomicBool::new(false),
+            external_stop: Some(external_stop),
+            nodes: AtomicU64::new(0),
+            start_time: UnsafeCell::new(Instant::now()),
+            time_limit: UnsafeCell::new(None),
+            tt: TranspositionTable::new(256),
+        }
+    }
+
     /// Create a new search with custom TT size
     pub fn with_tt_size(tt_size_mb: usize) -> Self {
         Search {
             stop: AtomicBool::new(false),
+            external_stop: None,
+            nodes: AtomicU64::new(0),
+            start_time: UnsafeCell::new(Instant::now()),
+            time_limit: UnsafeCell::new(None),
+            tt: TranspositionTable::new(tt_size_mb),
+        }
+    }
+
+    /// Create a new search with custom TT size and external stop signal
+    pub fn with_config(tt_size_mb: usize, external_stop: Arc<AtomicBool>) -> Self {
+        Search {
+            stop: AtomicBool::new(false),
+            external_stop: Some(external_stop),
             nodes: AtomicU64::new(0),
             start_time: UnsafeCell::new(Instant::now()),
             time_limit: UnsafeCell::new(None),
@@ -70,13 +99,12 @@ impl Search {
         let mut best_score = 0;
 
         // Get legal moves first
-        let legal_moves =
-            MoveGen::generate_legal_moves_ep(
-                &position.board,
-                position.state.side_to_move,
-                position.state.ep_square,
-                position.state.castling_rights,
-            );
+        let legal_moves = MoveGen::generate_legal_moves_ep(
+            &position.board,
+            position.state.side_to_move,
+            position.state.ep_square,
+            position.state.castling_rights,
+        );
 
         // No legal moves - checkmate or stalemate
         if legal_moves.is_empty() {
@@ -104,12 +132,7 @@ impl Search {
                 break;
             }
 
-            let (mv, score) = self.alphabeta(
-                position,
-                d,
-                -32000,
-                32000,
-            );
+            let (mv, score) = self.alphabeta(position, d, -32000, 32000);
 
             // Validate the move from this iteration
             let mut mv_is_legal = false;
@@ -171,13 +194,7 @@ impl Search {
     }
 
     /// Alpha-beta search
-    fn alphabeta(
-        &self,
-        position: &Position,
-        depth: u32,
-        mut alpha: i32,
-        beta: i32,
-    ) -> (Move, i32) {
+    fn alphabeta(&self, position: &Position, depth: u32, mut alpha: i32, beta: i32) -> (Move, i32) {
         if self.should_stop() {
             return (Move::null(), 0);
         }
@@ -216,11 +233,24 @@ impl Search {
             if entry.depth >= depth as u8 {
                 // Verify TT move is actually legal before returning
                 let tt_move = entry.best_move;
+
+                // First check if move is pseudo-legal (catches most illegal moves quickly)
+                let tt_move_pseudo_legal = MoveGen::is_pseudo_legal(
+                    &position.board,
+                    tt_move,
+                    color,
+                    position.state.ep_square,
+                    position.state.castling_rights,
+                );
+
+                // Then check if it's in our generated legal moves list
                 let mut tt_move_legal = false;
-                for i in 0..moves.len() {
-                    if moves.get(i) == tt_move {
-                        tt_move_legal = true;
-                        break;
+                if tt_move_pseudo_legal {
+                    for i in 0..moves.len() {
+                        if moves.get(i) == tt_move {
+                            tt_move_legal = true;
+                            break;
+                        }
                     }
                 }
 
@@ -284,24 +314,26 @@ impl Search {
             #[cfg(debug_assertions)]
             {
                 // Check that we still have exactly one king per side
-                let white_kings = new_position.board.piece_bb(crate::piece::PieceType::King, crate::piece::Color::White).count();
-                let black_kings = new_position.board.piece_bb(crate::piece::PieceType::King, crate::piece::Color::Black).count();
+                let white_kings = new_position
+                    .board
+                    .piece_bb(crate::piece::PieceType::King, crate::piece::Color::White)
+                    .count();
+                let black_kings = new_position
+                    .board
+                    .piece_bb(crate::piece::PieceType::King, crate::piece::Color::Black)
+                    .count();
                 if white_kings != 1 || black_kings != 1 {
-                    eprintln!("ERROR: After move {}, board has {} white kings and {} black kings",
-                             mv, white_kings, black_kings);
+                    eprintln!(
+                        "ERROR: After move {}, board has {} white kings and {} black kings",
+                        mv, white_kings, black_kings
+                    );
                     eprintln!("Original position:\n{}", position.board.to_string());
                     eprintln!("New position:\n{}", new_position.board.to_string());
                 }
             }
 
             // Search with negated score
-            let (_, score) =
-                self.alphabeta(
-                    &new_position,
-                    depth - 1,
-                    -beta,
-                    -alpha,
-                );
+            let (_, score) = self.alphabeta(&new_position, depth - 1, -beta, -alpha);
 
             // Negate score for opponent's perspective
             let score = -score;
@@ -319,7 +351,8 @@ impl Search {
         }
 
         // Store in transposition table
-        self.tt.store(position.state.hash, best_move, alpha, depth as u8, tt_flag);
+        self.tt
+            .store(position.state.hash, best_move, alpha, depth as u8, tt_flag);
 
         // Final validation: ensure best_move is actually legal
         if !best_move.is_null() {
@@ -332,7 +365,10 @@ impl Search {
             }
             if !move_is_legal {
                 // Debug: This should never happen if our search is working correctly
-                println!("WARNING: Alpha-beta returned illegal move {} at depth {}", best_move, depth);
+                println!(
+                    "WARNING: Alpha-beta returned illegal move {} at depth {}",
+                    best_move, depth
+                );
                 println!("Available legal moves: {}", moves.len());
 
                 // If best_move is not legal, return the first legal move instead
@@ -351,13 +387,26 @@ impl Search {
 
     /// Check if search should stop
     fn should_stop(&self) -> bool {
+        // Check internal stop flag
         if self.stop.load(Ordering::Relaxed) {
             return true;
         }
 
+        // Check external stop signal (from main thread)
+        // BUT only after minimum search time to avoid race conditions
+        let elapsed = unsafe { (*self.start_time.get()).elapsed() };
+        if elapsed >= Duration::from_millis(50) {
+            if let Some(ref external) = self.external_stop {
+                if external.load(Ordering::Relaxed) {
+                    return true;
+                }
+            }
+        }
+
+        // Check time limit
         unsafe {
             if let Some(limit) = *self.time_limit.get() {
-                if (*self.start_time.get()).elapsed() >= limit {
+                if elapsed >= limit {
                     return true;
                 }
             }

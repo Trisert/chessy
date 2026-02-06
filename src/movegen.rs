@@ -134,6 +134,215 @@ impl MoveGen {
         false
     }
 
+    /// Check if a move is pseudo-legal (valid for the piece type without checking king safety)
+    /// This is used to validate moves from the transposition table
+    pub fn is_pseudo_legal(
+        board: &Board,
+        mv: Move,
+        side_to_move: Color,
+        ep_square: Option<Square>,
+        castling_rights: u8,
+    ) -> bool {
+        let from = mv.from();
+        let to = mv.to();
+
+        // Check there's a piece on the from square
+        let piece = match board.get_piece(from) {
+            Some(p) => p,
+            None => return false,
+        };
+
+        // Check it's the right color
+        if piece.color != side_to_move {
+            return false;
+        }
+
+        // Check destination is not occupied by our own piece
+        if let Some(dest_piece) = board.get_piece(to) {
+            if dest_piece.color == side_to_move {
+                return false;
+            }
+        }
+
+        // Check if the move is valid for the piece type
+        match piece.piece_type {
+            PieceType::Pawn => Self::is_pseudo_legal_pawn(board, mv, side_to_move, ep_square),
+            PieceType::Knight => {
+                let knight_moves = Self::knight_attacks(from);
+                knight_moves.get(to)
+            }
+            PieceType::Bishop => {
+                let bishop_moves = Self::bishop_attacks_on_the_fly(from, board.occupied());
+                bishop_moves.get(to)
+            }
+            PieceType::Rook => {
+                let rook_moves = Self::rook_attacks_on_the_fly(from, board.occupied());
+                rook_moves.get(to)
+            }
+            PieceType::Queen => {
+                let queen_moves = Self::bishop_attacks_on_the_fly(from, board.occupied())
+                    | Self::rook_attacks_on_the_fly(from, board.occupied());
+                queen_moves.get(to)
+            }
+            PieceType::King => {
+                // Normal king moves
+                let king_moves = Self::king_attacks(from);
+                if king_moves.get(to) {
+                    return true;
+                }
+                // Castling moves
+                // NOTE: 'to' in a castling move is the rook square (Stockfish encoding)
+                if mv.is_castle() {
+                    let king_dest = mv.castle_king_destination();
+                    return Self::is_castle_legal(board, side_to_move, castling_rights, king_dest);
+                }
+                false
+            }
+        }
+    }
+
+    /// Check if a pawn move is pseudo-legal
+    fn is_pseudo_legal_pawn(
+        board: &Board,
+        mv: Move,
+        color: Color,
+        ep_square: Option<Square>,
+    ) -> bool {
+        let from = mv.from();
+        let to = mv.to();
+        let from_rank = rank_of(from);
+        let to_rank = rank_of(to);
+        let from_file = file_of(from);
+        let to_file = file_of(to);
+
+        let (start_rank, promotion_rank, forward): (Rank, Rank, i8) = match color {
+            Color::White => (RANK_2, RANK_8, 8),
+            Color::Black => (RANK_7, RANK_1, -8i8),
+        };
+
+        // Check if it's a capture
+        let file_diff = (from_file as i8 - to_file as i8).abs();
+        let rank_diff = if color == Color::White {
+            to_rank as i8 - from_rank as i8
+        } else {
+            from_rank as i8 - to_rank as i8
+        };
+
+        // Pawn captures (including en passant)
+        if file_diff == 1 && rank_diff == 1 {
+            // Regular capture
+            if let Some(captured) = board.get_piece(to) {
+                if captured.color != color {
+                    // Check promotion
+                    if to_rank == promotion_rank {
+                        return mv.is_promotion();
+                    }
+                    return !mv.is_promotion();
+                }
+            }
+            // En passant capture
+            if let Some(ep_sq) = ep_square {
+                if to == ep_sq && !mv.is_promotion() {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // Single push
+        if file_diff == 0 && rank_diff == 1 {
+            if board.get_piece(to).is_some() {
+                return false; // Can't push to occupied square
+            }
+            // Check promotion
+            if to_rank == promotion_rank {
+                return mv.is_promotion();
+            }
+            return !mv.is_promotion();
+        }
+
+        // Double push
+        if file_diff == 0 && rank_diff == 2 {
+            if from_rank != start_rank {
+                return false; // Can only double push from starting rank
+            }
+            // Check intermediate square is empty
+            let intermediate = if color == Color::White {
+                from + 8
+            } else {
+                from - 8
+            };
+            if board.get_piece(intermediate).is_some() {
+                return false;
+            }
+            if board.get_piece(to).is_some() {
+                return false; // Can't push to occupied square
+            }
+            return !mv.is_promotion();
+        }
+
+        false
+    }
+
+    /// Check if a castling move is legal (all requirements except king safety)
+    fn is_castle_legal(board: &Board, color: Color, castling_rights: u8, king_to: Square) -> bool {
+        let (king_from, rook_from, required_rights) = if color == Color::White {
+            if king_to == 6 {
+                (4, 7, 0x01) // Kingside: e1 to g1, rook on h1
+            } else {
+                (4, 0, 0x02) // Queenside: e1 to c1, rook on a1
+            }
+        } else {
+            if king_to == 62 {
+                (60, 63, 0x04) // Kingside: e8 to g8, rook on h8
+            } else {
+                (60, 56, 0x08) // Queenside: e8 to c8, rook on a8
+            }
+        };
+
+        // Check castling rights
+        if castling_rights & required_rights == 0 {
+            return false;
+        }
+
+        // Check king is on starting square
+        if let Some(piece) = board.get_piece(king_from) {
+            if piece.piece_type != PieceType::King || piece.color != color {
+                return false;
+            }
+        } else {
+            return false;
+        }
+
+        // Check rook is on starting square
+        if let Some(piece) = board.get_piece(rook_from) {
+            if piece.piece_type != PieceType::Rook || piece.color != color {
+                return false;
+            }
+        } else {
+            return false;
+        }
+
+        // Check squares between king and destination are empty
+        let squares_to_check = if king_to == 6 {
+            vec![5, 6] // f1, g1
+        } else if king_to == 2 {
+            vec![1, 2, 3] // b1, c1, d1
+        } else if king_to == 62 {
+            vec![61, 62] // f8, g8
+        } else {
+            vec![57, 58, 59] // b8, c8, d8
+        };
+
+        for sq in squares_to_check {
+            if board.get_piece(sq).is_some() {
+                return false;
+            }
+        }
+
+        true
+    }
+
     /// Generate pawn moves with optional en passant
     fn generate_pawn_moves_ep(
         board: &Board,
@@ -329,9 +538,9 @@ impl MoveGen {
                     // To capture en passant on rank 6 (white), the white pawn must be on rank 5
                     // To capture en passant on rank 3 (black), the black pawn must be on rank 4
                     let correct_rank = if color == Color::White {
-                        RANK_5  // White pawns on rank 5 capture on rank 6
+                        RANK_5 // White pawns on rank 5 capture on rank 6
                     } else {
-                        RANK_4  // Black pawns on rank 4 capture on rank 3
+                        RANK_4 // Black pawns on rank 4 capture on rank 3
                     };
 
                     if pawn_rank == correct_rank {
@@ -656,31 +865,23 @@ impl MoveGen {
         let to = mv.to();
 
         // Handle castling first (before removing the piece from 'from')
+        // NOTE: Castling is encoded as "king captures friendly rook"
+        // So 'to' is the ROOK'S square, not the king's destination
         if mv.is_castle() {
+            let king_dest = mv.castle_king_destination();
+            let rook_from = to; // The 'to' square in a castling move is the rook's position
+            let rook_dest = mv.castle_rook_destination();
+
             // Move the king
             if let Some(king) = board.get_piece(from) {
                 board.remove_piece(king, from);
-                board.set_piece(king, to);
+                board.set_piece(king, king_dest);
             }
 
             // Move the rook
-            let (rook_from, rook_to) = if color == Color::White {
-                if to == 6 {
-                    (7, 5) // Kingside: h1 to f1
-                } else {
-                    (0, 3) // Queenside: a1 to d1
-                }
-            } else {
-                if to == 62 {
-                    (63, 61) // Kingside: h8 to f8
-                } else {
-                    (56, 59) // Queenside: a8 to d8
-                }
-            };
-
             if let Some(rook) = board.get_piece(rook_from) {
                 board.remove_piece(rook, rook_from);
-                board.set_piece(rook, rook_to);
+                board.set_piece(rook, rook_dest);
             }
             return;
         }

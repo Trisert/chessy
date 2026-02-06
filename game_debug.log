@@ -1,0 +1,36 @@
+Starting simulated game...
+==============================
+id name Chessy
+id author Chessy
+option name Hash type spin default 256 min 1 max 2048
+uciok
+readyok
+info nodes 1 nps 22294 time 0
+info depth 1 score cp 64 nodes 20 nps 66441 time 0 hashfull 0
+info depth 2 score cp 0 nodes 383 nps 65684 time 5 hashfull 0
+info depth 3 score cp 64 nodes 7099 nps 65848 time 107 hashfull 0
+info depth 4 score cp 0 nodes 87666 nps 57333 time 1529 hashfull 0
+info depth 5 score cp 84 nodes 447274 nps 58538 time 7640 hashfull 3
+bestmove e2e3
+  a b c d e f g h
+8 r n b q k b n r 
+7 p p p p p p p p 
+6 . . . . . . . . 
+5 . . . . . . . . 
+4 . . . . P . . . 
+3 . . . . . . . . 
+2 P P P P . P P P 
+1 R N B Q K B N R 
+
+Side to move: Black
+Castling rights: 1111
+En passant: e3
+Halfmove clock: 0
+Fullmove number: 1
+info nodes 1 nps 19063 time 0
+info depth 1 score cp 51 nodes 20 nps 34876 time 0 hashfull 0
+info depth 2 score cp -13 nodes 434 nps 63406 time 6 hashfull 0
+info depth 3 score cp 105 nodes 7307 nps 50546 time 144 hashfull 0
+info depth 4 score cp -71 nodes 120688 nps 58484 time 2063 hashfull 2
+info depth 5 score cp 117 nodes 808660 nps 48742 time 16590 hashfull 7
+bestmove b8c6

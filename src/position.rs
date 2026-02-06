@@ -106,16 +106,20 @@ impl Position {
         let ep_square = if parts[3] == "-" {
             None
         } else {
-            Some(crate::utils::square_from_string(parts[3])
-                .ok_or_else(|| format!("Invalid en passant square: {}", parts[3]))?)
+            Some(
+                crate::utils::square_from_string(parts[3])
+                    .ok_or_else(|| format!("Invalid en passant square: {}", parts[3]))?,
+            )
         };
 
         // Parse halfmove clock
-        let halfmove_clock = parts[4].parse()
+        let halfmove_clock = parts[4]
+            .parse()
             .map_err(|_| format!("Invalid halfmove clock: {}", parts[4]))?;
 
         // Parse fullmove number
-        let fullmove_number = parts[5].parse()
+        let fullmove_number = parts[5]
+            .parse()
             .map_err(|_| format!("Invalid fullmove number: {}", parts[5]))?;
 
         let mut position = Position {
@@ -162,13 +166,40 @@ impl Position {
 
     /// Make a move on the position
     pub fn make_move(&mut self, mv: Move) {
-        // Save current state to history
-        self.history.push(self.state.clone());
-        self.history_hashes.push(self.state.hash);
-
         let from = mv.from();
         let to = mv.to();
         let color = self.state.side_to_move;
+
+        // CRITICAL: Check if there's actually a piece to move BEFORE doing anything else
+        let maybe_piece = self.board.get_piece(from);
+        if maybe_piece.is_none() {
+            eprintln!(
+                "ERROR: make_move called with no piece on from square {} for move {}",
+                crate::utils::square_to_string(from),
+                mv
+            );
+            eprintln!("  Side to move: {:?}", color);
+            eprintln!("  Board state:\n{}", self.board.to_string());
+            // DO NOT update any state - just return
+            return;
+        }
+        let piece = maybe_piece.unwrap();
+
+        // CRITICAL: Verify the piece belongs to the side to move
+        if piece.color != color {
+            eprintln!(
+                "ERROR: make_move called with wrong color piece on from square {} for move {}",
+                crate::utils::square_to_string(from),
+                mv
+            );
+            eprintln!("  Expected color: {:?}, Got: {:?}", color, piece.color);
+            eprintln!("  Board state:\n{}", self.board.to_string());
+            return;
+        }
+
+        // Save current state to history
+        self.history.push(self.state.clone());
+        self.history_hashes.push(self.state.hash);
 
         // Debug: Check if move is legal before making it
         #[cfg(debug_assertions)]
@@ -196,7 +227,7 @@ impl Position {
 
         // Update halfmove clock
         let is_capture = self.board.get_piece(to).is_some();
-        let is_pawn_move = self.board.get_piece(from).map_or(false, |p| p.piece_type == crate::piece::PieceType::Pawn);
+        let is_pawn_move = piece.piece_type == crate::piece::PieceType::Pawn;
 
         if is_capture || is_pawn_move {
             self.state.halfmove_clock = 0;
@@ -210,7 +241,7 @@ impl Position {
         }
 
         // Make the move on the board
-        self.make_move_on_board(mv, color);
+        self.make_move_on_board(mv, color, piece);
 
         // Update side to move
         self.state.side_to_move = color.flip();
@@ -304,7 +335,10 @@ impl Position {
 
     /// Check if the game is over
     pub fn is_game_over(&self) -> bool {
-        self.is_checkmate() || self.is_stalemate() || self.is_threefold_repetition() || self.is_fifty_move_rule()
+        self.is_checkmate()
+            || self.is_stalemate()
+            || self.is_threefold_repetition()
+            || self.is_fifty_move_rule()
     }
 
     /// Get game result string
@@ -327,37 +361,41 @@ impl Position {
     }
 
     /// Make a move on the board (internal)
-    fn make_move_on_board(&mut self, mv: Move, color: Color) {
-        use crate::piece::{Piece, PieceType};
+    fn make_move_on_board(&mut self, mv: Move, color: Color, piece: crate::piece::Piece) {
+        use crate::piece::PieceType;
         use crate::r#move::PromotionType;
 
         let from = mv.from();
         let to = mv.to();
 
         // Handle castling
+        // NOTE: Castling is encoded as "king captures friendly rook"
+        // So 'to' is the ROOK'S square, not the king's destination
         if mv.is_castle() {
+            let king_dest = mv.castle_king_destination();
+            let rook_from = to; // The 'to' square in a castling move is the rook's position
+            let rook_dest = mv.castle_rook_destination();
+
             // Move the king
-            if let Some(king) = self.board.get_piece(from) {
-                self.board.remove_piece(king, from);
-                self.board.set_piece(king, to);
-            }
+            self.board.remove_piece(piece, from);
+            self.board.set_piece(piece, king_dest);
 
-            // Move the rook
-            let rook_from = if color == Color::White {
-                if to == 6 { 7 } else { 0 }  // Kingside: h1(7), Queenside: a1(0)
-            } else {
-                if to == 62 { 63 } else { 56 }  // Kingside: h8(63), Queenside: a8(56)
-            };
-
-            let rook_to = if color == Color::White {
-                if to == 6 { 5 } else { 3 }  // Kingside: f1(5), Queenside: d1(3)
-            } else {
-                if to == 62 { 61 } else { 59 }  // Kingside: f8(61), Queenside: d8(59)
-            };
-
+            // Move the rook (the 'captured' piece should be our own rook)
             if let Some(rook) = self.board.get_piece(rook_from) {
-                self.board.remove_piece(rook, rook_from);
-                self.board.set_piece(rook, rook_to);
+                if rook.piece_type == PieceType::Rook && rook.color == color {
+                    self.board.remove_piece(rook, rook_from);
+                    self.board.set_piece(rook, rook_dest);
+                } else {
+                    eprintln!(
+                        "ERROR: Castling move {} expected rook on {} but found {:?}",
+                        mv, rook_from, rook
+                    );
+                }
+            } else {
+                eprintln!(
+                    "ERROR: Castling move {} but no rook on {} (king on {})",
+                    mv, rook_from, from
+                );
             }
 
             return;
@@ -365,62 +403,46 @@ impl Position {
 
         // Handle en passant
         if mv.is_en_passant() {
-            if let Some(piece) = self.board.get_piece(from) {
-                self.board.remove_piece(piece, from);
-                self.board.set_piece(piece, to);
+            self.board.remove_piece(piece, from);
+            self.board.set_piece(piece, to);
 
-                // Remove the captured pawn
-                let captured_pawn_sq = if color == Color::White {
-                    to - 8  // White captures "behind" the EP square
-                } else {
-                    to + 8  // Black captures "behind" the EP square
-                };
+            // Remove the captured pawn
+            let captured_pawn_sq = if color == Color::White {
+                to - 8 // White captures "behind" the EP square
+            } else {
+                to + 8 // Black captures "behind" the EP square
+            };
 
-                if let Some(captured) = self.board.get_piece(captured_pawn_sq) {
-                    self.board.remove_piece(captured, captured_pawn_sq);
-                }
+            if let Some(captured) = self.board.get_piece(captured_pawn_sq) {
+                self.board.remove_piece(captured, captured_pawn_sq);
             }
             return;
         }
 
         // Normal move
-        if let Some(piece) = self.board.get_piece(from) {
-            self.board.remove_piece(piece, from);
+        self.board.remove_piece(piece, from);
 
-            // Handle captures
-            if let Some(captured) = self.board.get_piece(to) {
-                self.board.remove_piece(captured, to);
-            }
+        // Handle captures
+        if let Some(captured) = self.board.get_piece(to) {
+            self.board.remove_piece(captured, to);
+        }
 
-            // Handle promotions
-            if mv.is_promotion() {
-                if let Some(promo_type) = mv.promotion_type() {
-                    let promo_piece = Piece::new(
-                        color,
-                        match promo_type {
-                            PromotionType::Knight => PieceType::Knight,
-                            PromotionType::Bishop => PieceType::Bishop,
-                            PromotionType::Rook => PieceType::Rook,
-                            PromotionType::Queen => PieceType::Queen,
-                        },
-                    );
-                    self.board.set_piece(promo_piece, to);
-                }
-            } else {
-                self.board.set_piece(piece, to);
+        // Handle promotions
+        if mv.is_promotion() {
+            if let Some(promo_type) = mv.promotion_type() {
+                let promo_piece = crate::piece::Piece::new(
+                    color,
+                    match promo_type {
+                        PromotionType::Knight => PieceType::Knight,
+                        PromotionType::Bishop => PieceType::Bishop,
+                        PromotionType::Rook => PieceType::Rook,
+                        PromotionType::Queen => PieceType::Queen,
+                    },
+                );
+                self.board.set_piece(promo_piece, to);
             }
         } else {
-            // CRITICAL BUG: No piece on the 'from' square!
-            // Skip the ENTIRE move processing - don't update board OR state
-            // This prevents position state desynchronization
-            eprintln!("=== WARNING: get_piece({}) returned None ===", from);
-            eprintln!("  Square: {} ({})", from, crate::utils::square_to_string(from));
-            eprintln!("  Move: {} (from {} to {})", mv, from, to);
-            eprintln!("  This means the square is EMPTY or piece tracking is corrupted");
-            eprintln!("  Board state at this point:");
-            self.board.debug_print();
-            eprintln!("=== Skipping this move, continuing with rest of sequence ===");
-            return;
+            self.board.set_piece(piece, to);
         }
     }
 
@@ -505,6 +527,195 @@ impl Position {
         self.state.ep_square.hash(&mut hasher);
 
         hasher.finish()
+    }
+
+    /// Convert position to FEN string
+    pub fn to_fen(&self) -> String {
+        use crate::piece::{Color, PieceType};
+        use crate::utils::{file_of, rank_of};
+
+        let mut fen = String::new();
+
+        // 1. Piece placement
+        for rank in (0..8).rev() {
+            let mut empty_count = 0;
+            for file in 0..8 {
+                let sq = rank * 8 + file;
+                if let Some(piece) = self.board.get_piece(sq) {
+                    if empty_count > 0 {
+                        fen.push_str(&empty_count.to_string());
+                        empty_count = 0;
+                    }
+                    let piece_char = match (piece.color, piece.piece_type) {
+                        (Color::White, PieceType::Pawn) => 'P',
+                        (Color::White, PieceType::Knight) => 'N',
+                        (Color::White, PieceType::Bishop) => 'B',
+                        (Color::White, PieceType::Rook) => 'R',
+                        (Color::White, PieceType::Queen) => 'Q',
+                        (Color::White, PieceType::King) => 'K',
+                        (Color::Black, PieceType::Pawn) => 'p',
+                        (Color::Black, PieceType::Knight) => 'n',
+                        (Color::Black, PieceType::Bishop) => 'b',
+                        (Color::Black, PieceType::Rook) => 'r',
+                        (Color::Black, PieceType::Queen) => 'q',
+                        (Color::Black, PieceType::King) => 'k',
+                    };
+                    fen.push(piece_char);
+                } else {
+                    empty_count += 1;
+                }
+            }
+            if empty_count > 0 {
+                fen.push_str(&empty_count.to_string());
+            }
+            if rank > 0 {
+                fen.push('/');
+            }
+        }
+
+        // 2. Side to move
+        fen.push(' ');
+        fen.push(if self.state.side_to_move == Color::White {
+            'w'
+        } else {
+            'b'
+        });
+
+        // 3. Castling rights
+        fen.push(' ');
+        let mut has_castling = false;
+        if self.state.castling_rights & 0x01 != 0 {
+            fen.push('K');
+            has_castling = true;
+        }
+        if self.state.castling_rights & 0x02 != 0 {
+            fen.push('Q');
+            has_castling = true;
+        }
+        if self.state.castling_rights & 0x04 != 0 {
+            fen.push('k');
+            has_castling = true;
+        }
+        if self.state.castling_rights & 0x08 != 0 {
+            fen.push('q');
+            has_castling = true;
+        }
+        if !has_castling {
+            fen.push('-');
+        }
+
+        // 4. En passant square
+        fen.push(' ');
+        if let Some(ep_sq) = self.state.ep_square {
+            let file = (file_of(ep_sq) as u8 + b'a') as char;
+            let rank = (rank_of(ep_sq) as u8 + b'1') as char;
+            fen.push(file);
+            fen.push(rank);
+        } else {
+            fen.push('-');
+        }
+
+        // 5. Halfmove clock
+        fen.push(' ');
+        fen.push_str(&self.state.halfmove_clock.to_string());
+
+        // 6. Fullmove number
+        fen.push(' ');
+        fen.push_str(&self.state.fullmove_number.to_string());
+
+        fen
+    }
+
+    /// Comprehensive position validation (Stockfish-style pos_is_ok)
+    /// Returns Ok(()) if position is valid, Err with description if not
+    pub fn validate_position(&self) -> Result<(), String> {
+        let mut errors = Vec::new();
+
+        // Check side to move is valid
+        if self.state.side_to_move != Color::White && self.state.side_to_move != Color::Black {
+            errors.push(format!(
+                "Invalid side to move: {:?}",
+                self.state.side_to_move
+            ));
+        }
+
+        // Check both kings exist
+        let white_king_sq = self.board.king_square(Color::White);
+        let black_king_sq = self.board.king_square(Color::Black);
+
+        if white_king_sq.is_none() {
+            errors.push("White king is missing".to_string());
+        }
+        if black_king_sq.is_none() {
+            errors.push("Black king is missing".to_string());
+        }
+
+        // Check kings are not in invalid positions
+        if let Some(sq) = white_king_sq {
+            if let Some(piece) = self.board.get_piece(sq) {
+                if piece.piece_type != crate::piece::PieceType::King || piece.color != Color::White
+                {
+                    errors.push(format!(
+                        "White king square {} has wrong piece: {:?}",
+                        sq, piece
+                    ));
+                }
+            }
+        }
+        if let Some(sq) = black_king_sq {
+            if let Some(piece) = self.board.get_piece(sq) {
+                if piece.piece_type != crate::piece::PieceType::King || piece.color != Color::Black
+                {
+                    errors.push(format!(
+                        "Black king square {} has wrong piece: {:?}",
+                        sq, piece
+                    ));
+                }
+            }
+        }
+
+        // Check EP square is valid
+        if let Some(ep_sq) = self.state.ep_square {
+            let ep_rank = crate::utils::rank_of(ep_sq);
+            let expected_rank = if self.state.side_to_move == Color::White {
+                5
+            } else {
+                2
+            };
+            if ep_rank != expected_rank {
+                errors.push(format!(
+                    "Invalid EP square {} for side {:?}",
+                    ep_sq, self.state.side_to_move
+                ));
+            }
+        }
+
+        // Check hash matches board state
+        let computed_hash = self.compute_hash();
+        if computed_hash != self.state.hash {
+            errors.push(format!(
+                "Hash mismatch: computed {}, stored {}",
+                computed_hash, self.state.hash
+            ));
+        }
+
+        // Check board consistency
+        if let Err(board_err) = self.board.validate() {
+            errors.push(format!("Board validation failed: {}", board_err));
+        }
+
+        // Check for overlapping pieces between colors
+        let white_pieces = self.board.color_bb(Color::White);
+        let black_pieces = self.board.color_bb(Color::Black);
+        if !(white_pieces & black_pieces).is_empty() {
+            errors.push("Overlapping pieces between colors".to_string());
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
     }
 }
 

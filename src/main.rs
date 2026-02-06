@@ -63,7 +63,7 @@ fn run_uci_mode() {
                 println!("readyok");
             }
             "ucinewgame" => {
-                _search = Search::new();
+                _search = Search::with_stop_signal(stop_signal.clone());
                 position = Position::from_start();
             }
             "position" => {
@@ -86,7 +86,7 @@ fn run_uci_mode() {
                     let value = parts[4];
                     if name == "Hash" {
                         if let Ok(size_mb) = value.parse::<usize>() {
-                            _search = Search::with_tt_size(size_mb);
+                            _search = Search::with_config(size_mb, stop_signal.clone());
                         }
                     }
                 }
@@ -133,8 +133,13 @@ fn handle_position(parts: &[&str], position: &mut Position) {
                     let from_sq = mv.from();
                     // Check if there's actually a piece on the from square BEFORE making the move
                     if position.board.get_piece(from_sq).is_none() {
-                        eprintln!("STATE CORRUPTION: No piece on {} for move '{}' (move #{}/{})",
-                                  square_to_string(from_sq), parts[i], i - 2, parts.len() - 3);
+                        eprintln!(
+                            "STATE CORRUPTION: No piece on {} for move '{}' (move #{}/{})",
+                            square_to_string(from_sq),
+                            parts[i],
+                            i - 2,
+                            parts.len() - 3
+                        );
                         eprintln!("  Skipping move and continuing");
                         continue; // Skip this move instead of making it
                     }
@@ -157,8 +162,11 @@ fn handle_position(parts: &[&str], position: &mut Position) {
                         let from_sq = mv.from();
                         // Check if there's actually a piece on the from square BEFORE making the move
                         if position.board.get_piece(from_sq).is_none() {
-                            eprintln!("STATE CORRUPTION (FEN): No piece on {} for move '{}'",
-                                      square_to_string(from_sq), parts[i]);
+                            eprintln!(
+                                "STATE CORRUPTION (FEN): No piece on {} for move '{}'",
+                                square_to_string(from_sq),
+                                parts[i]
+                            );
                             eprintln!("  Skipping move and continuing");
                             continue; // Skip this move instead of making it
                         }
@@ -178,6 +186,9 @@ fn handle_go(
     search: &mut Search,
     stop_signal: &Arc<AtomicBool>,
 ) {
+    // IMPORTANT: Reset stop signal before starting a new search
+    stop_signal.store(false, std::sync::atomic::Ordering::Relaxed);
+
     // Parse go command parameters
     let mut wtime: Option<u64> = None;
     let mut btime: Option<u64> = None;
@@ -245,23 +256,43 @@ fn handle_go(
         position.state.fullmove_number,
     );
 
+    // Validate position before cloning (comprehensive check)
+    if let Err(err) = position.validate_position() {
+        eprintln!("ERROR: Invalid position state before search!");
+        eprintln!("{}", err);
+        eprintln!("Position FEN: {}", position.to_fen());
+        position.board.debug_print();
+        // Still continue - maybe we can recover
+    }
+
+    // Also check board consistency
+    if let Err(err) = position.board.validate() {
+        eprintln!("ERROR: Invalid board state before search!");
+        eprintln!("{}", err);
+        position.board.debug_print();
+    }
+
     // Clone position for thread BEFORE search starts
     // Create a fresh copy to avoid race conditions during search
     let position_clone = position.clone();
-    
+
     // Debug: Check if the cloned position is identical to the original
     if position_clone.state.hash != position.state.hash {
-        println!("WARNING: Position hash mismatch! Clone: {}, Original: {}", 
-                 position_clone.state.hash, position.state.hash);
+        println!(
+            "WARNING: Position hash mismatch! Clone: {}, Original: {}",
+            position_clone.state.hash, position.state.hash
+        );
     }
 
     // Create channel for sending best move back
     let (tx, rx) = mpsc::channel();
 
+    // Clone stop signal for the search thread
+    let stop_signal_for_search = stop_signal.clone();
+
     // Spawn search thread
-    let _stop_signal_clone = stop_signal.clone();
     thread::spawn(move || {
-        let mut search = Search::new();
+        let mut search = Search::with_stop_signal(stop_signal_for_search);
 
         let time_limit = if let Some(mt) = movetime {
             Some(mt)
@@ -361,26 +392,75 @@ fn handle_go(
 
     // Validate the move before outputting
     if !best_move.is_null() {
-        let legal_moves =
-            MoveGen::generate_legal_moves_ep(
-                &position.board,
-                position.state.side_to_move,
-                position.state.ep_square,
-                position.state.castling_rights,
-            );
+        // First check pseudo-legal (faster, catches most errors)
+        let is_pseudo_legal = MoveGen::is_pseudo_legal(
+            &position.board,
+            best_move,
+            position.state.side_to_move,
+            position.state.ep_square,
+            position.state.castling_rights,
+        );
+
+        let legal_moves = MoveGen::generate_legal_moves_ep(
+            &position.board,
+            position.state.side_to_move,
+            position.state.ep_square,
+            position.state.castling_rights,
+        );
         let mut move_is_legal = false;
-        for i in 0..legal_moves.len() {
-            if legal_moves.get(i) == best_move {
-                move_is_legal = true;
-                break;
+        if is_pseudo_legal {
+            for i in 0..legal_moves.len() {
+                if legal_moves.get(i) == best_move {
+                    move_is_legal = true;
+                    break;
+                }
             }
         }
         if !move_is_legal {
-            // Debug output to stdout so cutechess captures it
-            println!(
-                "info string ILLEGAL MOVE DETECTED: {} for side {:?}",
+            // Debug output to stderr for visibility
+            eprintln!("");
+            eprintln!("=== ILLEGAL MOVE DETECTED ===");
+            eprintln!(
+                "Move: {} for side {:?}",
                 best_move, position.state.side_to_move
             );
+            eprintln!("Position state:");
+            eprintln!("  Side to move: {:?}", position.state.side_to_move);
+            eprintln!("  Fullmove: {}", position.state.fullmove_number);
+            eprintln!("  Hash: {}", position.state.hash);
+            eprintln!("Board:");
+            eprintln!("{}", position.board.to_string());
+
+            // Output FEN for debugging
+            eprintln!("Position FEN: {}", position.to_fen());
+
+            // Check what piece (if any) is on the from square
+            let from_sq = best_move.from();
+            let to_sq = best_move.to();
+            if let Some(piece) = position.board.get_piece(from_sq) {
+                eprintln!(
+                    "Piece on {}: {:?} {:?}",
+                    from_sq, piece.color, piece.piece_type
+                );
+                if piece.color != position.state.side_to_move {
+                    eprintln!(
+                        "ERROR: Wrong color piece! Expected {:?}, got {:?}",
+                        position.state.side_to_move, piece.color
+                    );
+                }
+            } else {
+                eprintln!("ERROR: No piece on from square {}", from_sq);
+            }
+
+            // Check what's on the to square
+            if let Some(piece) = position.board.get_piece(to_sq) {
+                eprintln!(
+                    "Destination {} has: {:?} {:?}",
+                    to_sq, piece.color, piece.piece_type
+                );
+            } else {
+                eprintln!("Destination {} is empty", to_sq);
+            }
 
             // Check king position
             let king_sq = position.board.king_square(position.state.side_to_move);
@@ -390,8 +470,14 @@ fn handle_go(
                     sq,
                     position.state.side_to_move.flip(),
                 );
-                println!("info string King at {} in_check={}", sq, in_check);
+                eprintln!("King at {} in_check={}", sq, in_check);
+            } else {
+                eprintln!(
+                    "ERROR: No king found for side {:?}",
+                    position.state.side_to_move
+                );
             }
+            eprintln!("==============================");
 
             // Try to find a better fallback move instead of just using the first one
             let mut fallback_move = Move::null();
@@ -400,21 +486,27 @@ fn handle_go(
                 // (same piece type, similar direction, etc.)
                 let illegal_from = best_move.from();
                 let _illegal_to = best_move.to();
-                
+
                 for i in 0..legal_moves.len() {
                     let candidate = legal_moves.get(i);
                     if candidate.from() == illegal_from {
                         // Same starting square - this is a good fallback
                         fallback_move = candidate;
-                        println!("info string Found fallback with same from square: {}", candidate);
+                        println!(
+                            "info string Found fallback with same from square: {}",
+                            candidate
+                        );
                         break;
                     }
                 }
-                
+
                 if fallback_move.is_null() {
                     // No move with same from square, use first legal move
                     fallback_move = legal_moves.get(0);
-                    println!("info string Using first legal move as fallback: {}", fallback_move);
+                    println!(
+                        "info string Using first legal move as fallback: {}",
+                        fallback_move
+                    );
                 }
             } else {
                 println!("info string No legal moves available!");
@@ -423,8 +515,7 @@ fn handle_go(
             if !fallback_move.is_null() {
                 println!(
                     "info string Replacing illegal {} with {}",
-                    best_move,
-                    fallback_move
+                    best_move, fallback_move
                 );
                 best_move = fallback_move;
             } else {
@@ -461,20 +552,21 @@ fn calculate_time_budget(
         estimated_moves.saturating_sub(fullmove_number)
     });
 
-    // Use 1/15 to 1/25 of remaining time based on game phase
+    // Very aggressive time allocation for bullet (1+0) games
+    // Use 1/3 to 1/5 of remaining time based on game phase
     let time_fraction = if moves_left <= 10 {
-        20
+        3
     } else if moves_left >= 30 {
-        25
+        5
     } else {
-        15
+        4
     };
 
     let mut allocated = my_time / time_fraction;
     allocated = allocated.saturating_add(my_inc);
 
-    // Keep at least 10ms and leave 100ms buffer
-    let allocated = allocated.max(10).min(my_time.saturating_sub(100));
+    // Keep at least 100ms and leave only 20ms buffer for very fast games
+    let allocated = allocated.max(100).min(my_time.saturating_sub(20));
 
     Some(allocated)
 }
@@ -488,6 +580,26 @@ fn move_from_string(s: &str) -> Result<Move, String> {
 
     let from = square_from_string(&s[0..2]).ok_or("Invalid from square")?;
     let to = square_from_string(&s[2..4]).ok_or("Invalid to square")?;
+
+    // Detect castling moves in UCI format
+    // Kingside: e1g1 (white), e8g8 (black)
+    // Queenside: e1c1 (white), e8c8 (black)
+    // NOTE: UCI sends king destination (g1/g8/c1/c8), but we encode castling
+    // as "king captures rook" (h1/h8/a1/a8), so we need to convert
+    let is_castle = (from == 4 && (to == 6 || to == 2)) ||   // White: e1 to g1 or c1
+                    (from == 60 && (to == 62 || to == 58)); // Black: e8 to g8 or c8
+
+    if is_castle {
+        // Convert UCI destination to internal encoding (rook square)
+        let rook_sq = match (from, to) {
+            (4, 6) => 7,    // White kingside: king goes to g1(6), but we encode as capturing h1(7)
+            (4, 2) => 0,    // White queenside: king goes to c1(2), but we encode as capturing a1(0)
+            (60, 62) => 63, // Black kingside: king goes to g8(62), but we encode as capturing h8(63)
+            (60, 58) => 56, // Black queenside: king goes to c8(58), but we encode as capturing a8(56)
+            _ => to,        // Should not reach here
+        };
+        return Ok(Move::castle(from, rook_sq));
+    }
 
     // Handle promotion
     if s.len() >= 5 {

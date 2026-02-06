@@ -33,16 +33,17 @@ impl Castling {
         }
 
         // Kingside castle
+        // NOTE: We encode castling as "king captures rook", so 'to' is the ROOK square
         if color == Color::White {
             if castling_rights & WHITE_KINGSIDE != 0 {
                 if Self::can_kingside_castle(board, color) {
-                    moves[0] = Some(Move::castle(king_sq, 6));
+                    moves[0] = Some(Move::castle(king_sq, 7)); // King on e1 captures rook on h1
                 }
             }
         } else {
             if castling_rights & BLACK_KINGSIDE != 0 {
                 if Self::can_kingside_castle(board, color) {
-                    moves[0] = Some(Move::castle(king_sq, 62));
+                    moves[0] = Some(Move::castle(king_sq, 63)); // King on e8 captures rook on h8
                 }
             }
         }
@@ -51,13 +52,13 @@ impl Castling {
         if color == Color::White {
             if castling_rights & WHITE_QUEENSIDE != 0 {
                 if Self::can_queenside_castle(board, color) {
-                    moves[1] = Some(Move::castle(king_sq, 2));
+                    moves[1] = Some(Move::castle(king_sq, 0)); // King on e1 captures rook on a1
                 }
             }
         } else {
             if castling_rights & BLACK_QUEENSIDE != 0 {
                 if Self::can_queenside_castle(board, color) {
-                    moves[1] = Some(Move::castle(king_sq, 58));
+                    moves[1] = Some(Move::castle(king_sq, 56)); // King on e8 captures rook on a8
                 }
             }
         }

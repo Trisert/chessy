@@ -19,7 +19,9 @@ impl Move {
     /// Create a promotion move
     #[inline]
     pub fn promotion(from: Square, to: Square, promotion: PromotionType) -> Self {
-        Move((from as u16) | ((to as u16) << 6) | ((promotion as u16) << 12) | (1 << 15))
+        // Encode promotion piece in bits 12-14 with values 4-7
+        // (4=Knight, 5=Bishop, 6=Rook, 7=Queen)
+        Move((from as u16) | ((to as u16) << 6) | (((promotion as u16) + 4) << 12) | (1 << 15))
     }
 
     /// Create an en passant move
@@ -29,9 +31,46 @@ impl Move {
     }
 
     /// Create a castling move
+    /// NOTE: Stockfish encodes castling as "king captures friendly rook"
+    /// So the 'to' square is the ROOK'S square (h1/a1/h8/a8), not the king's destination
     #[inline]
-    pub fn castle(from: Square, to: Square) -> Self {
-        Move((from as u16) | ((to as u16) << 6) | (2 << 12) | (1 << 15))
+    pub fn castle(from: Square, rook_sq: Square) -> Self {
+        Move((from as u16) | ((rook_sq as u16) << 6) | (2 << 12) | (1 << 15))
+    }
+
+    /// Get the king's destination square for a castling move
+    /// Returns the square the king actually moves TO (g1/c1/g8/c8)
+    #[inline]
+    pub fn castle_king_destination(&self) -> Square {
+        if !self.is_castle() {
+            return self.to();
+        }
+        // For castling, 'to' is the rook square
+        // King destination depends on which side we castle
+        let rook_sq = self.to();
+        match rook_sq {
+            7 => 6,         // White kingside: h1(7) -> g1(6)
+            0 => 2,         // White queenside: a1(0) -> c1(2)
+            63 => 62,       // Black kingside: h8(63) -> g8(62)
+            56 => 58,       // Black queenside: a8(56) -> c8(58)
+            _ => self.to(), // Fallback
+        }
+    }
+
+    /// Get the rook's destination square for a castling move  
+    #[inline]
+    pub fn castle_rook_destination(&self) -> Square {
+        if !self.is_castle() {
+            return self.to();
+        }
+        let rook_sq = self.to();
+        match rook_sq {
+            7 => 5,   // White kingside: h1 -> f1
+            0 => 3,   // White queenside: a1 -> d1
+            63 => 61, // Black kingside: h8 -> f8
+            56 => 59, // Black queenside: a8 -> d8
+            _ => self.to(),
+        }
     }
 
     /// Get the source square
@@ -76,7 +115,8 @@ impl Move {
     #[inline]
     pub const fn promotion_type(self) -> Option<PromotionType> {
         if self.is_promotion() {
-            Some(match (self.0 >> 12) & 0x3 {
+            // Decode promotion piece from bits 12-14 (values 4-7, subtract 4 to get 0-3)
+            Some(match ((self.0 >> 12) & 0x7) - 4 {
                 0 => PromotionType::Knight,
                 1 => PromotionType::Bishop,
                 2 => PromotionType::Rook,
