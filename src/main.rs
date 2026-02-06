@@ -256,6 +256,16 @@ fn handle_go(
         position.state.fullmove_number,
     );
 
+    // Adaptive depth based on time budget for bullet games
+    let time_budget_ms = time_ms.unwrap_or(0);
+    if time_budget_ms > 0 && time_budget_ms < 200 {
+        // Bullet game: reduce depth to avoid time losses
+        depth = depth.min(4); // Cap at depth 4 for very fast games
+    } else if time_budget_ms > 0 && time_budget_ms < 500 {
+        // Fast blitz: moderate depth
+        depth = depth.min(6);
+    }
+
     // Validate position before cloning (comprehensive check)
     if let Err(err) = position.validate_position() {
         eprintln!("ERROR: Invalid position state before search!");

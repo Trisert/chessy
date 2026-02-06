@@ -306,31 +306,9 @@ impl Search {
         for i in 0..moves.len() {
             let mv = moves.get(i);
 
-            // Make move using Position (properly updates all state)
+            // Make move by cloning (safe for recursion)
             let mut new_position = position.clone();
             new_position.make_move(mv);
-
-            // Debug: validate board state after move
-            #[cfg(debug_assertions)]
-            {
-                // Check that we still have exactly one king per side
-                let white_kings = new_position
-                    .board
-                    .piece_bb(crate::piece::PieceType::King, crate::piece::Color::White)
-                    .count();
-                let black_kings = new_position
-                    .board
-                    .piece_bb(crate::piece::PieceType::King, crate::piece::Color::Black)
-                    .count();
-                if white_kings != 1 || black_kings != 1 {
-                    eprintln!(
-                        "ERROR: After move {}, board has {} white kings and {} black kings",
-                        mv, white_kings, black_kings
-                    );
-                    eprintln!("Original position:\n{}", position.board.to_string());
-                    eprintln!("New position:\n{}", new_position.board.to_string());
-                }
-            }
 
             // Search with negated score
             let (_, score) = self.alphabeta(&new_position, depth - 1, -beta, -alpha);

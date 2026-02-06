@@ -1,9 +1,32 @@
 use crate::board::Board;
-use crate::piece::Color;
+use crate::piece::{Color, Piece};
 use crate::r#move::Move;
 use crate::utils::Square;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+
+/// Information needed to undo a move
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct UndoInfo {
+    /// The move that was made
+    pub mv: Move,
+    /// Captured piece (if any)
+    pub captured: Option<Piece>,
+    /// Castling rights before the move
+    pub castling_rights: u8,
+    /// En passant square before the move
+    pub ep_square: Option<Square>,
+    /// Halfmove clock before the move
+    pub halfmove_clock: u32,
+    /// For en passant: the captured pawn position
+    pub ep_captured_sq: Option<Square>,
+    /// For promotions: the promoted piece type
+    pub promoted_piece: Option<Piece>,
+    /// Fullmove number before the move
+    pub fullmove_number: u32,
+    /// Hash before the move
+    pub hash: u64,
+}
 
 /// Position state for undo/redo functionality
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,6 +76,8 @@ pub struct Position {
     pub history: Vec<PositionState>,
     /// Hash of history positions
     pub history_hashes: Vec<u64>,
+    /// Undo stack for fast make/undo during search
+    pub undo_stack: Vec<UndoInfo>,
 }
 
 impl Position {
@@ -63,6 +88,7 @@ impl Position {
             state: PositionState::new(),
             history: Vec::new(),
             history_hashes: Vec::new(),
+            undo_stack: Vec::new(),
         };
         position.state.hash = position.compute_hash();
         position
@@ -134,6 +160,7 @@ impl Position {
             },
             history: Vec::new(),
             history_hashes: Vec::new(),
+            undo_stack: Vec::new(),
         };
 
         position.state.hash = position.compute_hash();
@@ -159,6 +186,7 @@ impl Position {
             },
             history: Vec::new(),
             history_hashes: Vec::new(),
+            undo_stack: Vec::new(),
         };
         position.state.hash = position.compute_hash();
         position
@@ -267,6 +295,288 @@ impl Position {
             // need to track the board state changes more carefully
             // For now, we'll rebuild the position from the current state
         }
+    }
+
+    /// Make a move on the position (fast version for search)
+    /// Returns UndoInfo that can be used to undo the move
+    /// This does NOT update the history vectors (for performance during search)
+    pub fn make_move_fast(&mut self, mv: Move) {
+        use crate::piece::PieceType;
+        use crate::r#move::PromotionType;
+
+        let from = mv.from();
+        let to = mv.to();
+        let color = self.state.side_to_move;
+
+        // Get the piece to move
+        let piece = match self.board.get_piece(from) {
+            Some(p) => p,
+            None => {
+                eprintln!("ERROR: make_move_fast called with no piece on from square {}", from);
+                return;
+            }
+        };
+
+        // Verify piece color
+        if piece.color != color {
+            eprintln!("ERROR: make_move_fast called with wrong color piece");
+            return;
+        }
+
+        // Collect undo info BEFORE making any changes
+        let captured = self.board.get_piece(to);
+        let undo_info = UndoInfo {
+            mv,
+            captured,
+            castling_rights: self.state.castling_rights,
+            ep_square: self.state.ep_square,
+            halfmove_clock: self.state.halfmove_clock,
+            ep_captured_sq: None,
+            promoted_piece: None,
+            fullmove_number: self.state.fullmove_number,
+            hash: self.state.hash,
+        };
+
+        // Update halfmove clock
+        let is_capture = captured.is_some();
+        let is_pawn_move = piece.piece_type == PieceType::Pawn;
+
+        if is_capture || is_pawn_move {
+            self.state.halfmove_clock = 0;
+        } else {
+            self.state.halfmove_clock += 1;
+        }
+
+        // Update fullmove number
+        if color == Color::Black {
+            self.state.fullmove_number += 1;
+        }
+
+        // Handle castling (king captures rook encoding)
+        if mv.is_castle() {
+            let king_dest = mv.castle_king_destination();
+            let rook_from = to;
+            let rook_dest = mv.castle_rook_destination();
+
+            // Move the king
+            self.board.remove_piece(piece, from);
+            self.board.set_piece(piece, king_dest);
+
+            // Move the rook
+            if let Some(rook) = self.board.get_piece(rook_from) {
+                self.board.remove_piece(rook, rook_from);
+                self.board.set_piece(rook, rook_dest);
+            }
+
+            // Update castling rights
+            self.update_castling_rights(from, to);
+            self.state.side_to_move = color.flip();
+            self.state.ep_square = None;
+            self.state.hash = self.compute_hash();
+
+            self.undo_stack.push(undo_info);
+            return;
+        }
+
+        // Handle en passant
+        if mv.is_en_passant() {
+            self.board.remove_piece(piece, from);
+            self.board.set_piece(piece, to);
+
+            // Remove the captured pawn
+            let captured_pawn_sq = if color == Color::White {
+                to - 8
+            } else {
+                to + 8
+            };
+
+            if let Some(captured_pawn) = self.board.get_piece(captured_pawn_sq) {
+                self.board.remove_piece(captured_pawn, captured_pawn_sq);
+            }
+
+            // Update castling rights
+            self.update_castling_rights(from, to);
+            self.state.side_to_move = color.flip();
+            self.state.ep_square = None;
+
+            // Update undo info with EP capture square
+            let mut undo_with_ep = undo_info;
+            undo_with_ep.ep_captured_sq = Some(captured_pawn_sq);
+            self.undo_stack.push(undo_with_ep);
+            self.state.hash = self.compute_hash();
+            return;
+        }
+
+        // Handle promotions
+        let promoted_piece = if mv.is_promotion() {
+            if let Some(promo_type) = mv.promotion_type() {
+                Some(Piece::new(
+                    color,
+                    match promo_type {
+                        PromotionType::Knight => PieceType::Knight,
+                        PromotionType::Bishop => PieceType::Bishop,
+                        PromotionType::Rook => PieceType::Rook,
+                        PromotionType::Queen => PieceType::Queen,
+                    },
+                ))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Make the move on the board
+        self.board.remove_piece(piece, from);
+
+        // Handle captures
+        if let Some(captured_piece) = captured {
+            self.board.remove_piece(captured_piece, to);
+        }
+
+        // Place the piece (promoted or normal)
+        if let Some(promo) = promoted_piece {
+            self.board.set_piece(promo, to);
+        } else {
+            self.board.set_piece(piece, to);
+        }
+
+        // Update castling rights
+        self.update_castling_rights(from, to);
+
+        // Update en passant square
+        self.update_ep_square(mv, color);
+
+        // Update side to move
+        self.state.side_to_move = color.flip();
+
+        // Update hash
+        self.state.hash = self.compute_hash();
+
+        // Store undo info
+        let mut undo_final = undo_info;
+        undo_final.promoted_piece = promoted_piece;
+        self.undo_stack.push(undo_final);
+    }
+
+    /// Undo a move (fast version for search)
+    /// Uses UndoInfo from make_move_fast to efficiently undo
+    pub fn undo_move_fast(&mut self) {
+        use crate::piece::PieceType;
+
+        let undo_info = match self.undo_stack.pop() {
+            Some(info) => info,
+            None => {
+                eprintln!("ERROR: undo_move_fast called with empty undo stack");
+                return;
+            }
+        };
+
+        let mv = undo_info.mv;
+        let from = mv.from();
+        let to = mv.to();
+
+        // Restore side to move
+        let color = self.state.side_to_move.flip();
+
+        // Handle castling undo
+        if mv.is_castle() {
+            let king_dest = mv.castle_king_destination();
+            let rook_from = to;
+            let rook_dest = mv.castle_rook_destination();
+
+            // Get the king and rook
+            let king = match self.board.get_piece(king_dest) {
+                Some(k) => k,
+                None => {
+                    eprintln!("ERROR: undo_move_fast castling but no king on dest");
+                    return;
+                }
+            };
+
+            let rook = match self.board.get_piece(rook_dest) {
+                Some(r) => r,
+                None => {
+                    eprintln!("ERROR: undo_move_fast castling but no rook on dest");
+                    return;
+                }
+            };
+
+            // Move king back
+            self.board.remove_piece(king, king_dest);
+            self.board.set_piece(king, from);
+
+            // Move rook back
+            self.board.remove_piece(rook, rook_dest);
+            self.board.set_piece(rook, rook_from);
+        } else if mv.is_en_passant() {
+            // Undo en passant
+            let piece = match self.board.get_piece(to) {
+                Some(p) => p,
+                None => {
+                    eprintln!("ERROR: undo_move_fast en passant but no piece on dest");
+                    return;
+                }
+            };
+
+            // Move pawn back
+            self.board.remove_piece(piece, to);
+            self.board.set_piece(piece, from);
+
+            // Restore captured pawn
+            if let Some(captured_sq) = undo_info.ep_captured_sq {
+                if let Some(captured) = undo_info.captured {
+                    self.board.set_piece(captured, captured_sq);
+                }
+            }
+        } else if mv.is_promotion() {
+            // Undo promotion
+            let promoted = match self.board.get_piece(to) {
+                Some(p) => p,
+                None => {
+                    eprintln!("ERROR: undo_move_fast promotion but no piece on dest");
+                    return;
+                }
+            };
+
+            // Remove promoted piece
+            self.board.remove_piece(promoted, to);
+
+            // Restore original pawn
+            let original_piece = Piece::new(color.flip(), PieceType::Pawn);
+            self.board.set_piece(original_piece, from);
+
+            // Restore captured piece if any
+            if let Some(captured) = undo_info.captured {
+                self.board.set_piece(captured, to);
+            }
+        } else {
+            // Normal move
+            let piece = match self.board.get_piece(to) {
+                Some(p) => p,
+                None => {
+                    eprintln!("ERROR: undo_move_fast normal but no piece on dest");
+                    return;
+                }
+            };
+
+            // Move piece back
+            self.board.remove_piece(piece, to);
+            self.board.set_piece(piece, from);
+
+            // Restore captured piece if any
+            if let Some(captured) = undo_info.captured {
+                self.board.set_piece(captured, to);
+            }
+        }
+
+        // Restore state
+        self.state.castling_rights = undo_info.castling_rights;
+        self.state.ep_square = undo_info.ep_square;
+        self.state.halfmove_clock = undo_info.halfmove_clock;
+        self.state.fullmove_number = undo_info.fullmove_number;
+        self.state.hash = undo_info.hash;
+        self.state.side_to_move = color;
     }
 
     /// Check for threefold repetition
