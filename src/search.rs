@@ -4,20 +4,23 @@ use crate::piece::Color;
 use crate::position::Position;
 use crate::r#move::Move;
 use crate::transposition::{TTFlag, TranspositionTable};
-use std::cell::UnsafeCell;
+use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Search engine
 pub struct Search {
-    /// Flag to stop the search
+    /// Flag to stop the search (internal)
     stop: AtomicBool,
+    /// External stop signal (shared with main thread)
+    external_stop: Option<Arc<AtomicBool>>,
     /// Nodes searched
     nodes: AtomicU64,
-    /// Search start time (wrapped for interior mutability)
-    start_time: UnsafeCell<Instant>,
-    /// Time limit (wrapped for interior mutability)
-    time_limit: UnsafeCell<Option<Duration>>,
+    /// Search start time (interior mutability for single-threaded access)
+    start_time: Cell<Instant>,
+    /// Time limit (interior mutability for single-threaded access)
+    time_limit: Cell<Option<Duration>>,
     /// Transposition table
     tt: TranspositionTable,
 }
@@ -27,10 +30,23 @@ impl Search {
     pub fn new() -> Self {
         Search {
             stop: AtomicBool::new(false),
+            external_stop: None,
             nodes: AtomicU64::new(0),
-            start_time: UnsafeCell::new(Instant::now()),
-            time_limit: UnsafeCell::new(None),
+            start_time: Cell::new(Instant::now()),
+            time_limit: Cell::new(None),
             tt: TranspositionTable::new(256), // 256 MB TT
+        }
+    }
+
+    /// Create a new search with external stop signal
+    pub fn with_stop_signal(external_stop: Arc<AtomicBool>) -> Self {
+        Search {
+            stop: AtomicBool::new(false),
+            external_stop: Some(external_stop),
+            nodes: AtomicU64::new(0),
+            start_time: Cell::new(Instant::now()),
+            time_limit: Cell::new(None),
+            tt: TranspositionTable::new(256),
         }
     }
 
@@ -38,11 +54,34 @@ impl Search {
     pub fn with_tt_size(tt_size_mb: usize) -> Self {
         Search {
             stop: AtomicBool::new(false),
+            external_stop: None,
             nodes: AtomicU64::new(0),
-            start_time: UnsafeCell::new(Instant::now()),
-            time_limit: UnsafeCell::new(None),
+            start_time: Cell::new(Instant::now()),
+            time_limit: Cell::new(None),
             tt: TranspositionTable::new(tt_size_mb),
         }
+    }
+
+    /// Create a new search with custom TT size and external stop signal
+    pub fn with_config(tt_size_mb: usize, external_stop: Arc<AtomicBool>) -> Self {
+        Search {
+            stop: AtomicBool::new(false),
+            external_stop: Some(external_stop),
+            nodes: AtomicU64::new(0),
+            start_time: Cell::new(Instant::now()),
+            time_limit: Cell::new(None),
+            tt: TranspositionTable::new(tt_size_mb),
+        }
+    }
+
+    /// Get the TT size in MB
+    pub fn tt_size_mb(&self) -> usize {
+        self.tt.size_mb()
+    }
+
+    /// Set external stop signal (for use in spawned threads)
+    pub fn set_stop_signal(&mut self, external_stop: Arc<AtomicBool>) {
+        self.external_stop = Some(external_stop);
     }
 
     /// Run an iterative deepening search
@@ -58,10 +97,8 @@ impl Search {
         // Reset search state
         self.stop.store(false, Ordering::Relaxed);
         self.nodes.store(0, Ordering::Relaxed);
-        unsafe {
-            *self.start_time.get() = Instant::now();
-            *self.time_limit.get() = time_ms.map(Duration::from_millis);
-        }
+        self.start_time.set(Instant::now());
+        self.time_limit.set(time_ms.map(Duration::from_millis));
 
         // New search generation for TT
         self.tt.new_generation();
@@ -70,13 +107,12 @@ impl Search {
         let mut best_score = 0;
 
         // Get legal moves first
-        let legal_moves =
-            MoveGen::generate_legal_moves_ep(
-                &position.board,
-                position.state.side_to_move,
-                position.state.ep_square,
-                position.state.castling_rights,
-            );
+        let legal_moves = MoveGen::generate_legal_moves_ep(
+            &position.board,
+            position.state.side_to_move,
+            position.state.ep_square,
+            position.state.castling_rights,
+        );
 
         // No legal moves - checkmate or stalemate
         if legal_moves.is_empty() {
@@ -104,12 +140,16 @@ impl Search {
                 break;
             }
 
-            let (mv, score) = self.alphabeta(
-                position,
-                d,
-                -32000,
-                32000,
-            );
+            // Clone position for this depth iteration (alphabeta uses make_move_fast/undo_move_fast)
+            let mut search_position = position.clone();
+            let (mv, score) = self.alphabeta(&mut search_position, d, -32000, 32000);
+
+            // Check time after each depth iteration for bullet games
+            // This is crucial for 1+0 bullet where each move must be very fast
+            if self.should_stop() {
+                // Don't use this iteration's result if we're out of time
+                break;
+            }
 
             // Validate the move from this iteration
             let mut mv_is_legal = false;
@@ -128,7 +168,7 @@ impl Search {
                 best_score = score;
 
                 // Print UCI info
-                let elapsed = unsafe { (*self.start_time.get()).elapsed() };
+                let elapsed = self.start_time.get().elapsed();
                 let nodes = self.nodes.load(Ordering::Relaxed);
                 let nps = if elapsed.as_secs_f64() > 0.0 {
                     nodes as f64 / elapsed.as_secs_f64()
@@ -171,13 +211,7 @@ impl Search {
     }
 
     /// Alpha-beta search
-    fn alphabeta(
-        &self,
-        position: &Position,
-        depth: u32,
-        mut alpha: i32,
-        beta: i32,
-    ) -> (Move, i32) {
+    fn alphabeta(&self, position: &mut Position, depth: u32, mut alpha: i32, beta: i32) -> (Move, i32) {
         if self.should_stop() {
             return (Move::null(), 0);
         }
@@ -216,6 +250,8 @@ impl Search {
             if entry.depth >= depth as u8 {
                 // Verify TT move is actually legal before returning
                 let tt_move = entry.best_move;
+
+                // Check if it's in our generated legal moves list
                 let mut tt_move_legal = false;
                 for i in 0..moves.len() {
                     if moves.get(i) == tt_move {
@@ -225,32 +261,26 @@ impl Search {
                 }
 
                 if tt_move_legal {
-                    // Be more conservative with TT moves - only use them if they're from
-                    // a sufficiently deep search and the score is within bounds
-                    if entry.depth >= depth as u8 {
-                        match entry.flag {
-                            TTFlag::Exact => {
-                                // For exact scores, we can trust the TT move more
-                                if depth <= 3 || entry.depth >= depth as u8 + 2 {
-                                    return (tt_move, entry.score);
-                                }
+                    // Use standard TT cutoff logic - trust entries at sufficient depth
+                    match entry.flag {
+                        TTFlag::Exact => {
+                            return (tt_move, entry.score);
+                        }
+                        TTFlag::Lower => {
+                            if entry.score >= beta {
+                                return (tt_move, entry.score);
                             }
-                            TTFlag::Lower => {
-                                if entry.score >= beta {
-                                    // For beta cutoffs, be more careful
-                                    if depth <= 2 || entry.depth >= depth as u8 + 1 {
-                                        return (tt_move, entry.score);
-                                    }
-                                }
+                            // Tighten alpha bound
+                            if entry.score > alpha {
+                                alpha = entry.score;
                             }
-                            TTFlag::Upper => {
-                                if entry.score <= alpha {
-                                    // For alpha cutoffs, be more careful
-                                    if depth <= 2 || entry.depth >= depth as u8 + 1 {
-                                        return (tt_move, entry.score);
-                                    }
-                                }
+                        }
+                        TTFlag::Upper => {
+                            if entry.score <= alpha {
+                                return (tt_move, entry.score);
                             }
+                            // Could tighten beta bound here, but beta is not mutable
+                            // We could use the entry for move ordering though
                         }
                     }
                 }
@@ -274,37 +304,27 @@ impl Search {
         let mut tt_flag = TTFlag::Upper;
 
         for i in 0..moves.len() {
-            let mv = moves.get(i);
-
-            // Make move using Position (properly updates all state)
-            let mut new_position = position.clone();
-            new_position.make_move(mv);
-
-            // Debug: validate board state after move
-            #[cfg(debug_assertions)]
-            {
-                // Check that we still have exactly one king per side
-                let white_kings = new_position.board.piece_bb(crate::piece::PieceType::King, crate::piece::Color::White).count();
-                let black_kings = new_position.board.piece_bb(crate::piece::PieceType::King, crate::piece::Color::Black).count();
-                if white_kings != 1 || black_kings != 1 {
-                    eprintln!("ERROR: After move {}, board has {} white kings and {} black kings",
-                             mv, white_kings, black_kings);
-                    eprintln!("Original position:\n{}", position.board.to_string());
-                    eprintln!("New position:\n{}", new_position.board.to_string());
-                }
+            // Check time frequently (every move) for bullet chess responsiveness
+            // Note: This involves atomic loads but is crucial for 1+0 bullet where
+            // each move must complete very quickly. The overhead is negligible compared
+            // to the search work done at each node.
+            if self.should_stop() {
+                break;
             }
 
+            let mv = moves.get(i);
+
+            // Make move using fast do/unmake
+            position.make_move_fast(mv);
+
             // Search with negated score
-            let (_, score) =
-                self.alphabeta(
-                    &new_position,
-                    depth - 1,
-                    -beta,
-                    -alpha,
-                );
+            let (_, score) = self.alphabeta(position, depth - 1, -beta, -alpha);
 
             // Negate score for opponent's perspective
             let score = -score;
+
+            // Undo the move
+            position.undo_move_fast();
 
             if score > alpha {
                 alpha = score;
@@ -318,8 +338,18 @@ impl Search {
             }
         }
 
+        // Don't store partial results from aborted searches - they may contain
+        // incorrect scores from early-exit returns of (Move::null(), 0)
+        if self.should_stop() {
+            return (best_move, alpha);
+        }
+
         // Store in transposition table
-        self.tt.store(position.state.hash, best_move, alpha, depth as u8, tt_flag);
+        // Only store if we have a valid best_move, unless it's an upper bound (where null move is OK)
+        if !best_move.is_null() || tt_flag == TTFlag::Upper {
+            self.tt
+                .store(position.state.hash, best_move, alpha, depth as u8, tt_flag);
+        }
 
         // Final validation: ensure best_move is actually legal
         if !best_move.is_null() {
@@ -332,16 +362,19 @@ impl Search {
             }
             if !move_is_legal {
                 // Debug: This should never happen if our search is working correctly
-                println!("WARNING: Alpha-beta returned illegal move {} at depth {}", best_move, depth);
-                println!("Available legal moves: {}", moves.len());
+                eprintln!(
+                    "WARNING: Alpha-beta returned illegal move {} at depth {}",
+                    best_move, depth
+                );
+                eprintln!("Available legal moves: {}", moves.len());
 
                 // If best_move is not legal, return the first legal move instead
                 if moves.len() > 0 {
                     best_move = moves.get(0);
-                    println!("Fallback: Using first legal move {}", best_move);
+                    eprintln!("Fallback: Using first legal move {}", best_move);
                 } else {
                     best_move = Move::null();
-                    println!("Fallback: No legal moves available");
+                    eprintln!("Fallback: No legal moves available");
                 }
             }
         }
@@ -351,15 +384,26 @@ impl Search {
 
     /// Check if search should stop
     fn should_stop(&self) -> bool {
+        // Check internal stop flag
         if self.stop.load(Ordering::Relaxed) {
             return true;
         }
 
-        unsafe {
-            if let Some(limit) = *self.time_limit.get() {
-                if (*self.start_time.get()).elapsed() >= limit {
-                    return true;
-                }
+        // Check external stop signal (from main thread)
+        // Check immediately without any delay - we want to respond to UCI stop instantly
+        if let Some(ref external) = self.external_stop {
+            if external.load(Ordering::Relaxed) {
+                return true;
+            }
+        }
+
+        // Check time limit - use 95% of allocated time to leave safety margin
+        if let Some(limit) = self.time_limit.get() {
+            // Use 95% of time limit to leave margin for move output
+            let effective_limit = limit.mul_f64(0.95);
+            let elapsed = self.start_time.get().elapsed();
+            if elapsed >= effective_limit {
+                return true;
             }
         }
 
@@ -378,12 +422,8 @@ impl Search {
 
     /// Print search info
     fn print_info(&self) {
-        let (elapsed, nodes) = unsafe {
-            (
-                (*self.start_time.get()).elapsed(),
-                self.nodes.load(Ordering::Relaxed),
-            )
-        };
+        let elapsed = self.start_time.get().elapsed();
+        let nodes = self.nodes.load(Ordering::Relaxed);
         let nps = if elapsed.as_secs_f64() > 0.0 {
             nodes as f64 / elapsed.as_secs_f64()
         } else {

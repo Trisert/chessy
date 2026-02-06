@@ -21,6 +21,7 @@ pub mod piece;
 pub mod search;
 pub mod transposition;
 pub mod utils;
+pub mod zobrist;
 
 // Re-export commonly used types
 pub use bitboard::Bitboard;
