@@ -1,4 +1,4 @@
-use crate::piece::{Color, Piece, PieceType};
+use crate::piece::Piece;
 use crate::utils::Square;
 use std::sync::LazyLock;
 
@@ -20,14 +20,10 @@ pub static ZOBRIST: LazyLock<Zobrist> = LazyLock::new(|| Zobrist::new());
 impl Zobrist {
     /// Create new Zobrist tables with random 64-bit numbers
     fn new() -> Self {
-        use std::time::SystemTime;
+        // Fixed seed for reproducibility (non-zero to avoid degeneracy)
+        const FIXED_ZOBRIST_SEED: u64 = 0x9E3779B97F4A7C15;
 
-        let seed = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u64;
-
-        let mut rng = seed;
+        let mut rng = FIXED_ZOBRIST_SEED;
 
         // Initialize 3D array: [piece_type][color][square]
         let mut pieces: Vec<Vec<Vec<u64>>> = Vec::new();
@@ -104,11 +100,11 @@ impl Zobrist {
 }
 
 /// Simple random number generator (xorshift64*)
+/// Uses standard xorshift64* algorithm
 fn random_u64(state: &mut u64) -> u64 {
     *state ^= *state >> 12;
     *state ^= *state << 25;
     *state ^= *state >> 27;
-    let result = state.wrapping_mul(2685821657736338717);
-    *state = state.wrapping_add(1);
-    result
+    *state = state.wrapping_mul(2685821657736338717);
+    *state
 }

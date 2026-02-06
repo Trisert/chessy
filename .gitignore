@@ -14,3 +14,4 @@ illegal_moves_analysis.txt
 cutechess-cli
 test_king
 test_king.cperf.data*
+perf.data*

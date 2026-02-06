@@ -99,6 +99,62 @@ impl Move {
     pub const fn null() -> Self {
         Move(0)
     }
+
+    /// Get king's destination square for castling
+    /// Castling is encoded as "king captures rook", so we compute
+    /// where the king actually ends up
+    #[inline]
+    pub const fn castle_king_destination(self) -> Square {
+        let from = self.from();
+        // White castling
+        if from == 4 {
+            // e1 -> g1 (kingside) or c1 (queenside)
+            if self.to() == 7 {
+                6 // g1
+            } else {
+                2 // c1
+            }
+        }
+        // Black castling
+        else if from == 60 {
+            // e8 -> g8 (kingside) or c8 (queenside)
+            if self.to() == 63 {
+                62 // g8
+            } else {
+                58 // c8
+            }
+        } else {
+            from // Should not happen for castling moves
+        }
+    }
+
+    /// Get rook's destination square for castling
+    /// Castling is encoded as "king captures rook", so we compute
+    /// where the rook actually ends up
+    #[inline]
+    pub const fn castle_rook_destination(self) -> Square {
+        let from = self.from();
+        // White castling
+        if from == 4 {
+            // e1 castling
+            if self.to() == 7 {
+                5 // h1 -> f1
+            } else {
+                3 // a1 -> d1
+            }
+        }
+        // Black castling
+        else if from == 60 {
+            // e8 castling
+            if self.to() == 63 {
+                61 // h8 -> f8
+            } else {
+                59 // a8 -> d8
+            }
+        } else {
+            self.to() // Should not happen for castling moves
+        }
+    }
 }
 
 impl std::fmt::Display for Move {

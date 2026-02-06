@@ -1,5 +1,5 @@
 use chessy::movegen::MoveGen;
-use chessy::piece::{Color, PieceType};
+use chessy::piece::Color;
 use chessy::position::Position;
 use chessy::r#move::{Move, PromotionType};
 use chessy::search::Search;
@@ -36,7 +36,7 @@ fn main() {
 fn run_uci_mode() {
     let stdin = io::stdin();
     let mut position = Position::from_start();
-    let mut _search = Search::new();
+    let mut search = Search::new();
     let stop_signal = Arc::new(AtomicBool::new(false));
 
     loop {
@@ -63,7 +63,7 @@ fn run_uci_mode() {
                 println!("readyok");
             }
             "ucinewgame" => {
-                _search = Search::with_stop_signal(stop_signal.clone());
+                search = Search::with_stop_signal(stop_signal.clone());
                 position = Position::from_start();
             }
             "position" => {
@@ -71,7 +71,7 @@ fn run_uci_mode() {
             }
             "go" => {
                 let stop_signal_clone = stop_signal.clone();
-                handle_go(&parts, &mut position, &mut _search, &stop_signal_clone);
+                handle_go(&parts, &mut position, &mut search, &stop_signal_clone);
             }
             "stop" => {
                 stop_signal.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -86,7 +86,7 @@ fn run_uci_mode() {
                     let value = parts[4];
                     if name == "Hash" {
                         if let Ok(size_mb) = value.parse::<usize>() {
-                            _search = Search::with_config(size_mb, stop_signal.clone());
+                            search = Search::with_config(size_mb, stop_signal.clone());
                         }
                     }
                 }
@@ -183,7 +183,7 @@ fn handle_position(parts: &[&str], position: &mut Position) {
 fn handle_go(
     parts: &[&str],
     position: &mut Position,
-    search: &mut Search,
+    _search: &mut Search,
     stop_signal: &Arc<AtomicBool>,
 ) {
     // IMPORTANT: Reset stop signal before starting a new search
@@ -294,7 +294,7 @@ fn handle_go(
 
     // Debug: Check if the cloned position is identical to the original
     if position_clone.state.hash != position.state.hash {
-        println!(
+        eprintln!(
             "WARNING: Position hash mismatch! Clone: {}, Original: {}",
             position_clone.state.hash, position.state.hash
         );
@@ -408,15 +408,6 @@ fn handle_go(
 
     // Validate the move before outputting
     if !best_move.is_null() {
-        // First check pseudo-legal (faster, catches most errors)
-        let is_pseudo_legal = MoveGen::is_pseudo_legal(
-            &position.board,
-            best_move,
-            position.state.side_to_move,
-            position.state.ep_square,
-            position.state.castling_rights,
-        );
-
         let legal_moves = MoveGen::generate_legal_moves_ep(
             &position.board,
             position.state.side_to_move,
@@ -424,12 +415,10 @@ fn handle_go(
             position.state.castling_rights,
         );
         let mut move_is_legal = false;
-        if is_pseudo_legal {
-            for i in 0..legal_moves.len() {
-                if legal_moves.get(i) == best_move {
-                    move_is_legal = true;
-                    break;
-                }
+        for i in 0..legal_moves.len() {
+            if legal_moves.get(i) == best_move {
+                move_is_legal = true;
+                break;
             }
         }
         if !move_is_legal {
@@ -563,9 +552,9 @@ fn calculate_time_budget(
     };
 
     let moves_left = movestogo.unwrap_or_else(|| {
-        // Estimate remaining moves
+        // Estimate remaining moves, with minimum of 5 to avoid overly aggressive allocation
         let estimated_moves: u32 = 40;
-        estimated_moves.saturating_sub(fullmove_number)
+        estimated_moves.saturating_sub(fullmove_number).max(5)
     });
 
     // Very aggressive time allocation for bullet (1+0) games

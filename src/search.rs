@@ -241,54 +241,32 @@ impl Search {
                 // Verify TT move is actually legal before returning
                 let tt_move = entry.best_move;
 
-                // First check if move is pseudo-legal (catches most illegal moves quickly)
-                let tt_move_pseudo_legal = MoveGen::is_pseudo_legal(
-                    &position.board,
-                    tt_move,
-                    color,
-                    position.state.ep_square,
-                    position.state.castling_rights,
-                );
-
-                // Then check if it's in our generated legal moves list
+                // Check if it's in our generated legal moves list
                 let mut tt_move_legal = false;
-                if tt_move_pseudo_legal {
-                    for i in 0..moves.len() {
-                        if moves.get(i) == tt_move {
-                            tt_move_legal = true;
-                            break;
-                        }
+                for i in 0..moves.len() {
+                    if moves.get(i) == tt_move {
+                        tt_move_legal = true;
+                        break;
                     }
                 }
 
                 if tt_move_legal {
-                    // Be more conservative with TT moves - only use them if they're from
-                    // a sufficiently deep search and the score is within bounds
-                    if entry.depth >= depth as u8 {
-                        match entry.flag {
-                            TTFlag::Exact => {
-                                // For exact scores, we can trust the TT move more
-                                if depth <= 3 || entry.depth >= depth as u8 + 2 {
-                                    return (tt_move, entry.score);
-                                }
-                            }
-                            TTFlag::Lower => {
-                                if entry.score >= beta {
-                                    // For beta cutoffs, be more careful
-                                    if depth <= 2 || entry.depth >= depth as u8 + 1 {
-                                        return (tt_move, entry.score);
-                                    }
-                                }
-                            }
-                            TTFlag::Upper => {
-                                if entry.score <= alpha {
-                                    // For alpha cutoffs, be more careful
-                                    if depth <= 2 || entry.depth >= depth as u8 + 1 {
-                                        return (tt_move, entry.score);
-                                    }
-                                }
+                    // Use standard TT cutoff logic - trust entries at sufficient depth
+                    match entry.flag {
+                        TTFlag::Exact => {
+                            return (tt_move, entry.score);
+                        }
+                        TTFlag::Lower => {
+                            if entry.score >= beta {
+                                return (tt_move, entry.score);
                             }
                         }
+                        TTFlag::Upper => {
+                            if entry.score <= alpha {
+                                return (tt_move, entry.score);
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -312,7 +290,8 @@ impl Search {
 
         for i in 0..moves.len() {
             // Check time frequently at root (every move) for bullet chess
-            if depth > 3 && self.should_stop() {
+            // Don't skip check for shallow searches - depth 1-2 need it too!
+            if self.should_stop() {
                 break;
             }
 
