@@ -298,16 +298,29 @@ impl MoveGen {
 
     /// Check if a castling move is legal (all requirements except king safety)
     fn is_castle_legal(board: &Board, color: Color, castling_rights: u8, king_to: Square) -> bool {
+        // Standard square indices: E1=4, G1=6, C1=2, E8=60, G8=62, C8=58
+        // Rook squares: H1=7, A1=0, H8=63, A8=56
+        const G1: Square = 6;
+        const C1: Square = 2;
+        const G8: Square = 62;
+        const C8: Square = 58;
+        const E1: Square = 4;
+        const H1: Square = 7;
+        const A1: Square = 0;
+        const E8: Square = 60;
+        const H8: Square = 63;
+        const A8: Square = 56;
+
         let (king_from, rook_from, required_rights) = if color == Color::White {
             match king_to {
-                6 => (4, 7, 0x01),  // Kingside: e1 to g1, rook on h1
-                2 => (4, 0, 0x02),  // Queenside: e1 to c1, rook on a1
+                G1 => (E1, H1, 0x01),  // Kingside: e1 to g1, rook on h1
+                C1 => (E1, A1, 0x02),  // Queenside: e1 to c1, rook on a1
                 _ => return false, // Invalid castling destination
             }
         } else {
             match king_to {
-                62 => (60, 63, 0x04), // Kingside: e8 to g8, rook on h8
-                58 => (60, 56, 0x08), // Queenside: e8 to c8, rook on a8
+                G8 => (E8, H8, 0x04), // Kingside: e8 to g8, rook on h8
+                C8 => (E8, A8, 0x08), // Queenside: e8 to c8, rook on a8
                 _ => return false,   // Invalid castling destination
             }
         };

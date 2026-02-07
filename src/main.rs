@@ -759,7 +759,9 @@ fn move_from_string(s: &str, position: &Position) -> Result<Move, String> {
     // 1. It's a diagonal pawn move (file changes, rank advances by 1)
     // 2. The destination is the ep_square
     // 3. The destination is empty (pawn capture)
-    let file_diff = (from as i8 - to as i8).abs() == 1;
+    let from_file = (from % 8) as i8;
+    let to_file = (to % 8) as i8;
+    let file_diff = (from_file - to_file).abs() == 1;
     let is_en_passant = if let Some(ep) = position.state.ep_square {
         // Check if this is a diagonal pawn move to the ep square
         if file_diff && to == ep {
@@ -845,8 +847,6 @@ fn run_depth_profile(fen: Option<&str>) {
 }
 
 fn analyze_depth_profile(position: &Position) {
-    use chessy::piece::Color;
-
     // Get basic info
     let color = position.state.side_to_move;
     let eval = chessy::evaluation::Evaluation::evaluate(&position.board);
