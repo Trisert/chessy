@@ -28,6 +28,8 @@ unsafe fn avx2_material_count(board: &Board, color: Color) -> i32 {
         board.piece_bb(PieceType::King, color).as_u64(),
     ];
 
+    // SAFETY: This function is marked unsafe and requires AVX2 target feature
+    // The caller must ensure CPU supports AVX2 (checked via target_feature)
     unsafe {
         // Count bits using hardware popcnt
         let counts = _mm256_set_epi32(
@@ -263,75 +265,85 @@ impl Evaluation {
         score
     }
 
-    /// Get pawn PST (white perspective)
+    /// Get pawn PST (white perspective) - static const array for performance
     #[inline]
-    fn get_pawn_pst() -> [i32; 64] {
-        let mut pst = [0i32; 64];
-        for sq in 0..64 {
-            let rank = sq / 8;
-            let file = sq % 8;
-            let base = [0, 5, 10, 20, 30, 40, 50, 0][rank];
-            let center_bonus = match file {
-                3 | 4 => 5,
-                2 | 5 => 2,
-                _ => 0,
-            };
-            pst[sq] = base + center_bonus;
-        }
-        pst
+    fn get_pawn_pst() -> &'static [i32; 64] {
+        const PAWN_PST: [i32; 64] = {
+            let mut pst = [0i32; 64];
+            let mut sq = 0;
+            while sq < 64 {
+                let rank = sq / 8;
+                let file = sq % 8;
+                let base = [0, 5, 10, 20, 30, 40, 50, 0][rank];
+                let center_bonus = match file {
+                    3 | 4 => 5,
+                    2 | 5 => 2,
+                    _ => 0,
+                };
+                pst[sq] = base + center_bonus;
+                sq += 1;
+            }
+            pst
+        };
+        &PAWN_PST
     }
 
-    /// Get knight PST
+    /// Get knight PST - static const array for performance
     #[inline]
-    fn get_knight_pst() -> [i32; 64] {
-        [
+    fn get_knight_pst() -> &'static [i32; 64] {
+        const KNIGHT_PST: [i32; 64] = [
             -50, -40, -30, -30, -30, -30, -40, -50, -40, -20, 0, 0, 0, 0, -20, -40, -30, 0, 10, 15,
             15, 10, 0, -30, -30, 5, 15, 20, 20, 15, 5, -30, -30, 0, 15, 20, 20, 15, 0, -30, -30, 5,
             10, 15, 15, 10, 5, -30, -40, -20, 0, 5, 5, 0, -20, -40, -50, -40, -30, -30, -30, -30,
             -40, -50,
-        ]
+        ];
+        &KNIGHT_PST
     }
 
-    /// Get bishop PST
+    /// Get bishop PST - static const array for performance
     #[inline]
-    fn get_bishop_pst() -> [i32; 64] {
-        [
+    fn get_bishop_pst() -> &'static [i32; 64] {
+        const BISHOP_PST: [i32; 64] = [
             -20, -10, -10, -10, -10, -10, -10, -20, -10, 0, 0, 0, 0, 0, 0, -10, -10, 0, 5, 10, 10,
             5, 0, -10, -10, 5, 5, 10, 10, 5, 5, -10, -10, 0, 10, 10, 10, 10, 0, -10, -10, 10, 10,
             10, 10, 10, 10, -10, -10, 5, 0, 0, 0, 0, 5, -10, -20, -10, -10, -10, -10, -10, -10,
             -20,
-        ]
+        ];
+        &BISHOP_PST
     }
 
-    /// Get rook PST
+    /// Get rook PST - static const array for performance
     #[inline]
-    fn get_rook_pst() -> [i32; 64] {
-        [
+    fn get_rook_pst() -> &'static [i32; 64] {
+        const ROOK_PST: [i32; 64] = [
             0, 0, 0, 0, 0, 0, 0, 0, 5, 10, 10, 10, 10, 10, 10, 5, -5, 0, 0, 0, 0, 0, 0, -5, -5, 0,
             0, 0, 0, 0, 0, -5, -5, 0, 0, 0, 0, 0, 0, -5, -5, 0, 0, 0, 0, 0, 0, -5, -5, 0, 0, 0, 0,
             0, 0, -5, 0, 0, 0, 5, 5, 0, 0, 0,
-        ]
+        ];
+        &ROOK_PST
     }
 
-    /// Get queen PST
+    /// Get queen PST - static const array for performance
     #[inline]
-    fn get_queen_pst() -> [i32; 64] {
-        [
+    fn get_queen_pst() -> &'static [i32; 64] {
+        const QUEEN_PST: [i32; 64] = [
             -20, -10, -10, -5, -5, -10, -10, -20, -10, 0, 0, 0, 0, 0, 0, -10, -10, 0, 5, 5, 5, 5,
             0, -10, -5, 0, 5, 5, 5, 5, 0, -5, 0, 0, 5, 5, 5, 5, 0, -5, -10, 5, 5, 5, 5, 5, 0, -10,
             -10, 0, 5, 0, 0, 0, 0, -10, -20, -10, -10, -5, -5, -10, -10, -20,
-        ]
+        ];
+        &QUEEN_PST
     }
 
-    /// Get king PST (midgame)
+    /// Get king PST (midgame) - static const array for performance
     #[inline]
-    fn get_king_pst() -> [i32; 64] {
-        [
+    fn get_king_pst() -> &'static [i32; 64] {
+        const KING_PST: [i32; 64] = [
             -30, -40, -40, -50, -50, -40, -40, -30, -30, -40, -40, -50, -50, -40, -40, -30, -30,
             -40, -40, -50, -50, -40, -40, -30, -30, -40, -40, -50, -50, -40, -40, -30, -20, -30,
             -30, -40, -40, -30, -30, -20, -10, -20, -20, -20, -20, -20, -20, -10, 20, 20, 0, 0, 0,
             0, 20, 20, 20, 30, 10, 0, 0, 10, 30, 20,
-        ]
+        ];
+        &KING_PST
     }
 
     /// Pawn piece-square table lookup

@@ -82,6 +82,18 @@ impl MoveGen {
     /// Check if a move is legal (doesn't leave king in check)
     /// Uses Position for proper state handling (castling, en passant, etc.)
     pub fn is_move_legal(position: &Position, mv: Move, side_to_move: Color) -> bool {
+        // CRITICAL: First check if move is pseudo-legal
+        // This prevents illegal moves (like backward pawn captures) from being accepted
+        if !Self::is_pseudo_legal(
+            &position.board,
+            mv,
+            side_to_move,
+            position.state.ep_square,
+            position.state.castling_rights,
+        ) {
+            return false;
+        }
+
         // Make the move using Position to properly update all state
         let mut test_position = position.clone();
         test_position.make_move(mv);
@@ -287,16 +299,16 @@ impl MoveGen {
     /// Check if a castling move is legal (all requirements except king safety)
     fn is_castle_legal(board: &Board, color: Color, castling_rights: u8, king_to: Square) -> bool {
         let (king_from, rook_from, required_rights) = if color == Color::White {
-            if king_to == 6 {
-                (4, 7, 0x01) // Kingside: e1 to g1, rook on h1
-            } else {
-                (4, 0, 0x02) // Queenside: e1 to c1, rook on a1
+            match king_to {
+                6 => (4, 7, 0x01),  // Kingside: e1 to g1, rook on h1
+                2 => (4, 0, 0x02),  // Queenside: e1 to c1, rook on a1
+                _ => return false, // Invalid castling destination
             }
         } else {
-            if king_to == 62 {
-                (60, 63, 0x04) // Kingside: e8 to g8, rook on h8
-            } else {
-                (60, 56, 0x08) // Queenside: e8 to c8, rook on a8
+            match king_to {
+                62 => (60, 63, 0x04), // Kingside: e8 to g8, rook on h8
+                58 => (60, 56, 0x08), // Queenside: e8 to c8, rook on a8
+                _ => return false,   // Invalid castling destination
             }
         };
 
@@ -324,17 +336,17 @@ impl MoveGen {
         }
 
         // Check squares between king and destination are empty
-        let squares_to_check = if king_to == 6 {
-            vec![5, 6] // f1, g1
+        let squares_to_check: &[Square] = if king_to == 6 {
+            &[5, 6] // f1, g1
         } else if king_to == 2 {
-            vec![1, 2, 3] // b1, c1, d1
+            &[1, 2, 3] // b1, c1, d1
         } else if king_to == 62 {
-            vec![61, 62] // f8, g8
+            &[61, 62] // f8, g8
         } else {
-            vec![57, 58, 59] // b8, c8, d8
+            &[57, 58, 59] // b8, c8, d8
         };
 
-        for sq in squares_to_check {
+        for &sq in squares_to_check {
             if board.get_piece(sq).is_some() {
                 return false;
             }

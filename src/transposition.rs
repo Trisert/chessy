@@ -182,13 +182,14 @@ impl TTCluster {
     #[inline]
     fn replacement_score(&self, idx: usize, new_depth: u8, new_age: u8) -> i32 {
         let entry = self.entries[idx];
-        let age_diff = (new_age as i16 - entry.get_age() as i16).abs();
+        // Use wrapping subtraction to handle age overflow correctly (modulo 256)
+        let age_diff = new_age.wrapping_sub(entry.get_age()) as i32;
 
         // Prefer replacing:
         // 1. Old entries (large age difference)
         // 2. Shallower entries
         // 3. Lower-depth entries
-        age_diff as i32 * 100 + (new_depth as i32 - entry.depth() as i32) * 10
+        age_diff * 100 + (new_depth as i32 - entry.depth() as i32) * 10
     }
 
     /// Store an entry in the cluster

@@ -20,12 +20,17 @@ fn main() {
                 let depth = args.get(2).and_then(|d| d.parse::<u32>().ok()).unwrap_or(1);
                 run_perft(depth);
             }
+            "--depth-profile" => {
+                // Optional FEN argument
+                let fen = args.get(2).map(|s| s.as_str());
+                run_depth_profile(fen);
+            }
             "--test-illegal" => {
                 test_illegal_move();
             }
             _ => {
                 eprintln!("Unknown argument: {}", args[1]);
-                eprintln!("Usage: chessy [--perft depth] [--test-illegal]");
+                eprintln!("Usage: chessy [--perft depth] [--depth-profile [fen]] [--test-illegal]");
                 std::process::exit(1);
             }
         }
@@ -153,7 +158,7 @@ fn handle_position(parts: &[&str], position: &mut Position) {
         // Parse moves if present
         if parts.len() > 2 && parts[2] == "moves" {
             for i in 3..parts.len() {
-                if let Ok(mv) = move_from_string(parts[i], position.state.ep_square) {
+                if let Ok(mv) = move_from_string(parts[i], position) {
                     let from_sq = mv.from();
                     // Check if there's actually a piece on the from square BEFORE making the move
                     if position.board.get_piece(from_sq).is_none() {
@@ -182,7 +187,7 @@ fn handle_position(parts: &[&str], position: &mut Position) {
             // Parse moves if present
             if let Some(moves_idx) = parts.iter().position(|&x| x == "moves") {
                 for i in (moves_idx + 1)..parts.len() {
-                    if let Ok(mv) = move_from_string(parts[i], position.state.ep_square) {
+                    if let Ok(mv) = move_from_string(parts[i], position) {
                         let from_sq = mv.from();
                         // Check if there's actually a piece on the from square BEFORE making the move
                         if position.board.get_piece(from_sq).is_none() {
@@ -304,8 +309,21 @@ fn handle_go(
         // Long rapid: depth 8
         depth = depth.min(8);
     } else if time_budget_ms >= 10000 {
-        // Classical time controls: depth 9 (not 10 - too slow!)
+        // Classical time controls: depth 9
         depth = depth.min(9);
+    }
+
+    // DYNAMIC DEPTH ADJUSTMENT based on position complexity
+    // Calculate depth modifier based on king safety, material imbalance, game phase, etc.
+    let depth_modifier = chessy::search::Search::calculate_depth_modifier(position);
+    if depth_modifier != 0 {
+        // Apply the modifier, ensuring depth stays within reasonable bounds
+        let new_depth = (depth as i32 + depth_modifier).max(1).min(15) as u32;
+        if new_depth != depth {
+            println!("info string Dynamic depth adjustment: {} -> {} (modifier: {})",
+                     depth, new_depth, depth_modifier);
+            depth = new_depth;
+        }
     }
 
     // Validate position before cloning (comprehensive check)
@@ -714,7 +732,9 @@ fn calculate_time_budget(
     Some(allocated)
 }
 
-fn move_from_string(s: &str, ep_square: Option<chessy::utils::Square>) -> Result<Move, String> {
+fn move_from_string(s: &str, position: &Position) -> Result<Move, String> {
+    use chessy::piece::PieceType;
+
     if s.len() < 4 {
         return Err("Move string too short".to_string());
     }
@@ -735,14 +755,29 @@ fn move_from_string(s: &str, ep_square: Option<chessy::utils::Square>) -> Result
         return Ok(Move::castle(from, to));
     }
 
-    // Detect en passant
-    // En passant: diagonal pawn move to the ep_square
-    let is_pawn_move = matches!(from % 8, 0 | 7); // Pawns are on ranks 1 and 6 (indices 8-15 and 48-55)
-    let file_diff = (from as i8 - to as i8).abs() == 1; // Diagonal move
-    if let Some(ep) = ep_square {
-        if is_pawn_move && file_diff && to == ep {
-            return Ok(Move::en_passant(from, to));
+    // Detect en passant by checking if:
+    // 1. It's a diagonal pawn move (file changes, rank advances by 1)
+    // 2. The destination is the ep_square
+    // 3. The destination is empty (pawn capture)
+    let file_diff = (from as i8 - to as i8).abs() == 1;
+    let is_en_passant = if let Some(ep) = position.state.ep_square {
+        // Check if this is a diagonal pawn move to the ep square
+        if file_diff && to == ep {
+            // Check if it's actually a pawn by looking at the from square
+            if let Some(piece) = position.board.get_piece(from) {
+                piece.piece_type == PieceType::Pawn && position.board.get_piece(to).is_none()
+            } else {
+                false
+            }
+        } else {
+            false
         }
+    } else {
+        false
+    };
+
+    if is_en_passant {
+        return Ok(Move::en_passant(from, to));
     }
 
     // Handle promotion
@@ -772,6 +807,174 @@ fn run_perft(depth: u32) {
     println!("\nPerft {} result: {}", depth, nodes);
     println!("Time: {:.2}s", elapsed.as_secs_f64());
     println!("Nodes/second: {:.0}", nodes as f64 / elapsed.as_secs_f64());
+}
+
+fn run_depth_profile(fen: Option<&str>) {
+    
+
+    // Test positions to use if no FEN provided
+    let test_positions = vec![
+        ("Start Position", "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"),
+        ("Italian Opening", "r1bqbnr1/pppp1ppp/2n5/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 3"),
+        ("Tactical Position", "r2q1rk1/ppp2ppp/2n1pn2/3p4/1bPP4/2NQPN2/PP3PPP/R3K2R w KQ - 3 11"),
+        ("Endgame - Material Imbalance", "8/8/4k3/8/8/4K3/4Q3/4R3 w - - 0 1"),
+        ("King Under Attack", "r1b1k2r/ppppqppp/2n2n2/4p3/2B1P3/3P1N2/PPP2PPP/RNBQ1K1R w kq - 5 6"),
+    ];
+
+    let positions_to_analyze: Vec<(String, &str)> = if let Some(fen_str) = fen {
+        vec![("Custom Position".to_string(), fen_str)]
+    } else {
+        test_positions.into_iter().map(|(n, f)| (n.to_string(), f)).collect()
+    };
+
+    for (name, fen) in positions_to_analyze {
+        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        println!("Position: {}", name);
+        println!("FEN: {}", fen);
+        println!();
+
+        match Position::from_fen(fen) {
+            Ok(position) => {
+                analyze_depth_profile(&position);
+            }
+            Err(e) => {
+                println!("ERROR: {}\n", e);
+            }
+        }
+    }
+}
+
+fn analyze_depth_profile(position: &Position) {
+    use chessy::piece::Color;
+
+    // Get basic info
+    let color = position.state.side_to_move;
+    let eval = chessy::evaluation::Evaluation::evaluate(&position.board);
+
+    println!("  Side to move: {:?}", color);
+    println!("  Static eval: {}", eval);
+
+    // Count pieces
+    let mut white_pieces = 0;
+    let mut black_pieces = 0;
+    for sq in 0..64 {
+        if let Some(piece) = position.board.get_piece(sq) {
+            match piece.color {
+                Color::White => white_pieces += 1,
+                Color::Black => black_pieces += 1,
+            }
+        }
+    }
+    println!("  Piece count: White {} | Black {}", white_pieces, black_pieces);
+
+    // Calculate depth modifier using the same logic as the engine
+    let modifier = chessy::search::Search::calculate_depth_modifier(position);
+
+    // Show breakdown
+    println!("\n  ══ DEPTH MODIFIER BREAKDOWN ═══");
+
+    // King safety
+    let king_sq = position.board.king_square(color);
+    if let Some(sq) = king_sq {
+        let king_attacked = chessy::movegen::MoveGen::is_square_attacked(&position.board, sq, color.flip());
+        if king_attacked {
+            println!("    ⚠️  King in check (+2)");
+        } else {
+            println!("    ✓ King not in check");
+        }
+
+        // Count nearby attackers
+        let king_file = (sq % 8) as i32;
+        let king_rank = (sq / 8) as i32;
+        let mut nearby = 0;
+        for from_sq in 0..64 {
+            if let Some(piece) = position.board.get_piece(from_sq) {
+                if piece.color == color.flip() {
+                    let file = (from_sq % 8) as i32;
+                    let rank = (from_sq / 8) as i32;
+                    let dist = (king_file - file).abs() + (king_rank - rank).abs();
+                    if dist <= 2 {
+                        nearby += 1;
+                    }
+                }
+            }
+        }
+        if nearby > 0 {
+            println!("    ⚠️  {} enemy piece(s) near king (+{})", nearby, nearby);
+        } else {
+            println!("    ✓ No enemy pieces near king");
+        }
+    }
+
+    // Material
+    let eval_abs = eval.abs();
+    if eval_abs > 500 {
+        println!("    ⚠️  Large material imbalance: {} cp (+2)", eval_abs);
+    } else if eval_abs > 200 {
+        println!("    ⚠️  Material imbalance: {} cp (+1)", eval_abs);
+    } else {
+        println!("    ✓ Material balanced");
+    }
+
+    // Game phase
+    let material = count_total_material(position);
+    if material < 20 {
+        println!("    🏁 Late endgame (+2)");
+    } else if material < 30 {
+        println!("    🏁 Endgame (+1)");
+    } else {
+        println!("    ℹ️  Middlegame/opening ({} units)", material);
+    }
+
+    // Mobility
+    let moves = chessy::movegen::MoveGen::generate_legal_moves_ep(
+        &position.board,
+        color,
+        position.state.ep_square,
+        position.state.castling_rights,
+    );
+    let move_count = moves.len();
+    if move_count > 40 {
+        println!("    🔓 High mobility: {} moves (+1)", move_count);
+    } else if move_count < 15 {
+        println!("    🔒 Low mobility: {} moves (-1)", move_count);
+    } else {
+        println!("    ℹ️  Normal mobility: {} moves", move_count);
+    }
+
+    println!("\n  ══ DEPTH MODIFIER SUMMARY ═══");
+    println!("    TOTAL modifier: {}\n", modifier);
+
+    println!("  ══ EFFECTIVE DEPTH BY TIME CONTROL ═══");
+    let time_controls = vec![("Bullet", 1), ("Blitz", 3), ("Rapid", 7), ("Classical", 9)];
+    for (name, base) in time_controls {
+        let effective = (base as i32 + modifier).max(1).min(15) as u32;
+        if effective != base {
+            println!("    {}: {} → {} ({:+})", name, base, effective, modifier);
+        } else {
+            println!("    {}: {} (no change)", name, base);
+        }
+    }
+    println!();
+}
+
+fn count_total_material(position: &Position) -> u32 {
+    use chessy::piece::PieceType;
+
+    let mut count = 0;
+    for sq in 0..64 {
+        if let Some(piece) = position.board.get_piece(sq) {
+            match piece.piece_type {
+                PieceType::Pawn => count += 1,
+                PieceType::Knight => count += 3,
+                PieceType::Bishop => count += 3,
+                PieceType::Rook => count += 5,
+                PieceType::Queen => count += 9,
+                PieceType::King => {}
+            }
+        }
+    }
+    count
 }
 
 fn perft(position: &Position, depth: u32) -> u64 {

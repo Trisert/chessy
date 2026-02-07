@@ -4,7 +4,6 @@ use crate::movelist::MoveList;
 use crate::piece::{Color, PieceType};
 use crate::position::Position;
 use crate::r#move::Move;
-use crate::utils::*;
 
 /// Maximum search depth for killer move and history table sizing
 pub const MAX_PLY: usize = 128;
@@ -37,7 +36,10 @@ pub fn mvv_lva_score(victim: PieceType, attacker: PieceType) -> i32 {
 /// Determines if a capture is profitable by calculating the material gain/loss
 /// if both sides capture on the square.
 /// Returns positive = winning capture, negative = losing capture
-pub fn see(board: &Board, mv: Move, side_to_move: Color) -> i32 {
+///
+/// Note: side_to_move parameter is unused but kept for future full SEE implementation
+/// that would simulate recaptures.
+pub fn see(board: &Board, mv: Move) -> i32 {
     let to = mv.to();
     let from = mv.from();
 
@@ -73,8 +75,8 @@ pub fn see(board: &Board, mv: Move, side_to_move: Color) -> i32 {
 
 /// Check if a capture is "winning" (positive SEE)
 #[inline]
-pub fn is_winning_capture(board: &Board, mv: Move, side_to_move: Color) -> bool {
-    see(board, mv, side_to_move) >= 0
+pub fn is_winning_capture(board: &Board, mv: Move) -> bool {
+    see(board, mv) >= 0
 }
 
 /// Check if a move is a capture (requires board context and side to move)
@@ -130,7 +132,7 @@ pub fn score_move(
     }
 
     // Check if this is a capture
-    let is_capture = is_capture(board, side_to_move, mv);
+    let is_cap = is_capture(board, side_to_move, mv);
 
     // Promotions (queen promotions are very valuable)
     if mv.is_promotion() {
@@ -153,11 +155,12 @@ pub fn score_move(
     }
 
     // Captures: use SEE to classify as winning or losing
-    if is_capture {
-        let see_score = see(board, mv, side_to_move);
+    // Winning captures should be scored higher than killers (500,000)
+    if is_cap {
+        let see_score = see(board, mv);
         if see_score >= 0 {
-            // Winning capture: base MVV-LVA + bonus
-            return 400_000 + mvv_lva_score(
+            // Winning capture: score higher than killers
+            return 900_000 + mvv_lva_score(
                 captured_piece_type(board, side_to_move, mv).unwrap_or(PieceType::Pawn),
                 board.get_piece(mv.from())
                     .map(|p| p.piece_type)
@@ -263,7 +266,9 @@ impl HistoryTable {
         to_sq: crate::utils::Square,
     ) -> i32 {
         let score = self.get(color, piece, to_sq);
-        (score * 1000) / self.max_score
+        // Use i64 to prevent overflow, then clamp to 0-1000 range
+        let normalized = ((score as i64 * 1000) / self.max_score as i64) as i32;
+        normalized.clamp(0, 1000)
     }
 }
 
@@ -409,7 +414,9 @@ impl MovePicker {
         picker
     }
 
-    /// Create a quiescent move picker (captures and checks only)
+    /// Create a quiescent move picker (captures and promotions only)
+    /// NOTE: Checks are NOT included because they cause exponential search explosion
+    /// The check extensions in the main search handle tactical sequences with checks
     pub fn new_quiescent(position: &Position) -> Self {
         let moves = MoveGen::generate_legal_moves_ep(
             &position.board,
@@ -419,14 +426,17 @@ impl MovePicker {
         );
 
         // Filter to only captures and promotions for quiescent search
+        // This prevents the search explosion that comes from including all checks
         let filtered_moves = {
             let mut temp = crate::movelist::MoveList::new();
+
             for i in 0..moves.len() {
                 let mv = moves.get(i);
                 let side_to_move = position.state.side_to_move;
                 let is_cap = is_capture(&position.board, side_to_move, mv);
                 let is_promo = mv.is_promotion();
 
+                // Include captures and promotions only
                 if is_cap || is_promo {
                     temp.push(mv);
                 }
@@ -491,7 +501,7 @@ impl MovePicker {
 
                 // Captures: use SEE
                 if score == 0 && is_cap {
-                    let see_score = see(board, mv, side_to_move);
+                    let see_score = see(board, mv);
                     if see_score >= 0 {
                         score = 400_000 + mvv_lva_score(
                             captured_piece_type(board, side_to_move, mv).unwrap_or(PieceType::Pawn),
@@ -558,7 +568,7 @@ fn score_move_simple(
 
     // Captures: use SEE to classify as winning or losing
     if is_cap {
-        let see_score = see(board, mv, side_to_move);
+        let see_score = see(board, mv);
         if see_score >= 0 {
             // Winning capture: base MVV-LVA + bonus
             return 400_000 + mvv_lva_score(

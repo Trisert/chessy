@@ -1,6 +1,6 @@
 use crate::evaluation::Evaluation;
 use crate::movegen::MoveGen;
-use crate::moveorder::{is_capture, HistoryTable, KillerTable, MovePicker, MAX_PLY};
+use crate::moveorder::{is_capture, HistoryTable, KillerTable, MovePicker};
 use crate::piece::Color;
 use crate::position::Position;
 use crate::r#move::Move;
@@ -114,6 +114,155 @@ impl Search {
         self.external_stop = Some(external_stop);
     }
 
+    /// Calculate dynamic depth adjustment based on position complexity
+    /// Returns a depth modifier (negative for simpler positions, positive for complex ones)
+    pub fn calculate_depth_modifier(position: &Position) -> i32 {
+        
+
+        let mut modifier = 0;
+
+        // Get static evaluation
+        let eval = Evaluation::evaluate(&position.board);
+        let eval_abs = eval.abs();
+
+        // 1. King safety: extend when king is under attack
+        let color = position.state.side_to_move;
+        let king_sq = position.board.king_square(color);
+        if let Some(sq) = king_sq {
+            let king_attacked = MoveGen::is_square_attacked(&position.board, sq, color.flip());
+            if king_attacked {
+                modifier += 2; // Extend when in check
+            }
+
+            // Check for attackers near king (within 3 squares)
+            let king_file = (sq % 8) as i32;
+            let king_rank = (sq / 8) as i32;
+
+            for from_sq in 0..64 {
+                if let Some(piece) = position.board.get_piece(from_sq) {
+                    if piece.color == color.flip() {
+                        let file = (from_sq % 8) as i32;
+                        let rank = (from_sq / 8) as i32;
+                        let dist = (king_file - file).abs() + (king_rank - rank).abs();
+
+                        if dist <= 2 {
+                            modifier += 1; // Opponent piece near king
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Material imbalance: extend in unbalanced positions
+        if eval_abs > 200 {
+            modifier += 1; // Significant material advantage/disadvantage
+        }
+        if eval_abs > 500 {
+            modifier += 1; // Large material difference
+        }
+
+        // 3. Game phase: deeper search in endgame
+        let total_material = Self::count_total_material(position);
+        if total_material < 30 {
+            // Endgame: pieces < 30 (roughly)
+            modifier += 1;
+        }
+        if total_material < 20 {
+            // Late endgame: very tactical
+            modifier += 1;
+        }
+
+        // 4. Pawn structure: extend with weak pawns/isolated pawns
+        let weak_pawns = Self::count_weak_pawns(position);
+        modifier += (weak_pawns / 2) as i32; // +1 depth per 2 weak pawns
+
+        // 5. Mobility: extend with many legal moves (complex position)
+        let legal_moves = MoveGen::generate_legal_moves_ep(
+            &position.board,
+            color,
+            position.state.ep_square,
+            position.state.castling_rights,
+        );
+        let move_count = legal_moves.len();
+        if move_count > 40 {
+            modifier += 1; // Many moves available
+        }
+        if move_count < 15 {
+            modifier -= 1; // Few moves (forced line)
+        }
+
+        // Clamp the modifier to reasonable bounds
+        modifier.max(-2).min(3)
+    }
+
+    /// Count total material on the board (simplified)
+    fn count_total_material(position: &Position) -> u32 {
+        use crate::piece::PieceType;
+
+        let mut count = 0;
+        for sq in 0..64 {
+            if let Some(piece) = position.board.get_piece(sq) {
+                match piece.piece_type {
+                    PieceType::Pawn => count += 1,
+                    PieceType::Knight => count += 3,
+                    PieceType::Bishop => count += 3,
+                    PieceType::Rook => count += 5,
+                    PieceType::Queen => count += 9,
+                    PieceType::King => {}
+                }
+            }
+        }
+        count
+    }
+
+    /// Count weak pawns (isolated or backward)
+    fn count_weak_pawns(position: &Position) -> u32 {
+        use crate::piece::PieceType;
+
+        let mut weak_pawns = 0;
+
+        for sq in 0..64 {
+            if let Some(piece) = position.board.get_piece(sq) {
+                if piece.piece_type == PieceType::Pawn {
+                    let file = sq % 8;
+                    let rank = sq / 8;
+
+                    // Check for pawn neighbors (same color, adjacent files)
+                    let has_support = if file > 0 {
+                        Self::has_friendly_pawn(position, sq - 1, piece.color, rank)
+                    } else {
+                        false
+                    } || if file < 7 {
+                        Self::has_friendly_pawn(position, sq + 1, piece.color, rank)
+                    } else {
+                        false
+                    };
+
+                    if !has_support {
+                        weak_pawns += 1;
+                    }
+                }
+            }
+        }
+
+        weak_pawns
+    }
+
+    /// Check if there's a friendly pawn on a specific file
+    fn has_friendly_pawn(position: &Position, file_sq: u8, color: Color, _rank: u8) -> bool {
+        use crate::piece::PieceType;
+
+        for r in 0..8 {
+            let sq = file_sq + r * 8;
+            if let Some(piece) = position.board.get_piece(sq) {
+                if piece.piece_type == PieceType::Pawn && piece.color == color {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Run an iterative deepening search
     pub fn search(&mut self, position: &Position, depth: u32, time_ms: Option<u64>) -> (Move, i32) {
         if self.threads > 1 {
@@ -199,15 +348,7 @@ impl Search {
 
             if let Some((mv, score)) = depth_best {
                 // Validate the move
-                let mut mv_is_legal = false;
-                for i in 0..legal_moves.len() {
-                    if legal_moves.get(i) == mv {
-                        mv_is_legal = true;
-                        break;
-                    }
-                }
-
-                if mv_is_legal {
+                if Self::is_move_in_list(mv, &legal_moves) {
                     best_move = mv;
                     best_score = score;
 
@@ -237,17 +378,8 @@ impl Search {
         // Final validation
         if best_move.is_null() {
             best_move = legal_moves.get(0);
-        } else {
-            let mut move_is_legal = false;
-            for i in 0..legal_moves.len() {
-                if legal_moves.get(i) == best_move {
-                    move_is_legal = true;
-                    break;
-                }
-            }
-            if !move_is_legal {
-                best_move = legal_moves.get(0);
-            }
+        } else if !Self::is_move_in_list(best_move, &legal_moves) {
+            best_move = legal_moves.get(0);
         }
 
         (best_move, best_score)
@@ -317,7 +449,10 @@ impl Search {
             .collect();
 
         // Update total node count
-        let total_nodes: u64 = results.len() as u64 * 1000; // Estimate
+        // TODO: This is an inaccurate estimate. The proper fix requires each thread-local
+        // Search instance to track and return its actual node count. For now, we use a rough
+        // estimate based on the number of moves searched.
+        let total_nodes: u64 = results.len() as u64 * 1000; // Rough estimate
         self.nodes.fetch_add(total_nodes, Ordering::Relaxed);
 
         // Find best result
@@ -402,15 +537,7 @@ impl Search {
             }
 
             // Validate the move from this iteration
-            let mut mv_is_legal = false;
-            if !mv.is_null() {
-                for i in 0..legal_moves.len() {
-                    if legal_moves.get(i) == mv {
-                        mv_is_legal = true;
-                        break;
-                    }
-                }
-            }
+            let mv_is_legal = !mv.is_null() && Self::is_move_in_list(mv, &legal_moves);
 
             // Only update best_move if the returned move is actually legal
             if mv_is_legal {
@@ -443,26 +570,20 @@ impl Search {
         if best_move.is_null() {
             // If no best move found, return the first legal move
             best_move = legal_moves.get(0);
-        } else {
-            // Double-check the move is still legal
-            let mut move_is_legal = false;
-            for i in 0..legal_moves.len() {
-                if legal_moves.get(i) == best_move {
-                    move_is_legal = true;
-                    break;
-                }
-            }
-            if !move_is_legal {
-                best_move = legal_moves.get(0);
-            }
+        } else if !Self::is_move_in_list(best_move, &legal_moves) {
+            best_move = legal_moves.get(0);
         }
 
         (best_move, best_score)
     }
 
+    /// Helper to check if a move is in a move list
+    fn is_move_in_list(mv: Move, moves: &crate::movelist::MoveList) -> bool {
+        (0..moves.len()).any(|i| moves.get(i) == mv)
+    }
+
     /// Check if a move is legal using fast validation
-    /// Returns Option<bool> where None means we couldn't determine legality quickly
-    /// and Some(bool) is the actual result - this allows caching of the result
+    /// Returns true if the move is both pseudo-legal and doesn't leave the king in check
     fn is_move_legal_optimized(position: &Position, mv: Move) -> bool {
         // First check if move is pseudo-legal
         if !MoveGen::is_pseudo_legal(
@@ -486,14 +607,14 @@ impl Search {
         position: &mut Position,
         mut alpha: i32,
         beta: i32,
-        ply: usize,
+        qs_depth: usize,  // Quiescent search depth (starts at 0, not global ply)
     ) -> i32 {
         if self.should_stop() {
             return 0;
         }
 
         // Limit quiescent search depth to prevent stack overflow
-        if ply >= 10 {
+        if qs_depth >= 10 {
             // At max depth, return static evaluation
             let static_eval = Evaluation::evaluate(&position.board);
             return if position.state.side_to_move == Color::White {
@@ -524,11 +645,7 @@ impl Search {
         // Generate captures only for quiescent search
         let mut move_picker = MovePicker::new_quiescent(position);
 
-        let mut move_count = 0;
-
         while let Some(mv) = move_picker.next_move() {
-            move_count += 1;
-
             // Delta pruning: if capture can't improve alpha enough, skip it
             // (unless it's a promotion which can be worth much more)
             if !mv.is_promotion() {
@@ -551,7 +668,7 @@ impl Search {
             }
 
             position.make_move_fast(mv);
-            let score = -self.quiescent(position, -beta, -alpha, ply + 1);
+            let score = -self.quiescent(position, -beta, -alpha, qs_depth + 1);
             position.undo_move_fast();
 
             if score >= beta {
@@ -575,6 +692,9 @@ impl Search {
         beta: i32,
         ply: usize,
     ) -> (Move, i32) {
+        // Use mutable alpha for the search (allows TT to improve alpha)
+        let mut alpha = alpha;
+
         // Prevent stack overflow
         if ply > 100 {
             return (Move::null(), alpha);
@@ -585,6 +705,17 @@ impl Search {
         }
 
         let color = position.state.side_to_move;
+
+        // Check if king is in check for check extension
+        let king_sq = match position.board.king_square(color) {
+            Some(sq) => sq,
+            None => return (Move::null(), -32000),
+        };
+        let in_check = MoveGen::is_square_attacked(&position.board, king_sq, color.flip());
+
+        // TEMPORARILY DISABLED: Check extension causing performance issues
+        // Apply check extension: search deeper when in check
+        let search_depth = depth; // if in_check { (depth + 2).min(20) } else { depth };
 
         // Get TT move for move ordering
         let tt_entry = self.tt.borrow().probe(position.state.hash);
@@ -610,15 +741,8 @@ impl Search {
 
         // No legal moves
         if move_picker.is_empty() {
-            let king_sq = match position.board.king_square(color) {
-                Some(sq) => sq,
-                None => return (Move::null(), -32000),
-            };
-
-            let in_check = MoveGen::is_square_attacked(&position.board, king_sq, color.flip());
-
             if in_check {
-                return (Move::null(), -32000 + (depth as i32));
+                return (Move::null(), -32000 + (search_depth as i32));
             } else {
                 return (Move::null(), 0);
             }
@@ -626,17 +750,19 @@ impl Search {
 
         // TT cutoff
         if let Some(entry) = tt_entry {
-            if entry.depth() >= depth as u8 {
+            if entry.depth() >= search_depth as u8 {
                 let tt_mv = entry.best_move();
                 if Self::is_move_legal_optimized(position, tt_mv) {
                     match entry.flag() {
                         TTFlag::Exact => return (tt_mv, entry.score()),
                         TTFlag::Lower => {
+                            // Lower bound: score >= actual, only cutoff on beta
                             if entry.score() >= beta {
                                 return (tt_mv, entry.score());
                             }
+                            // Update alpha but continue searching
                             if entry.score() > alpha {
-                                return (tt_mv, entry.score());
+                                alpha = entry.score();
                             }
                         }
                         TTFlag::Upper => {
@@ -650,23 +776,29 @@ impl Search {
         }
 
         // Leaf node - use quiescent search to extend through captures/checks
-        if depth == 0 {
+        if search_depth == 0 {
             let nodes = self.nodes.fetch_add(1, Ordering::Relaxed);
             if nodes % 1000000 == 0 {
                 self.print_info();
             }
-            // Use quiescent search to avoid horizon effect
-            let score = self.quiescent(position, alpha, beta, ply);
+            // Use quiescent search to avoid horizon effect (start qs_depth at 0)
+            let score = self.quiescent(position, alpha, beta, 0);
             return (Move::null(), score);
         }
 
         let mut best_move = Move::null();
         let mut best_score = alpha;
         let mut tt_flag = TTFlag::Upper;
-        let mut move_count = 0;
+        let mut searched_quiets: Vec<Move> = Vec::new();
 
         while let Some(mv) = move_picker.next_move() {
-            move_count += 1;
+            // Track quiet moves for history updates
+            let is_quiet = !is_capture(&position.board, color, mv)
+                && !mv.is_promotion()
+                && !mv.is_castle();
+            if is_quiet {
+                searched_quiets.push(mv);
+            }
 
             if self.should_stop() {
                 break;
@@ -674,7 +806,7 @@ impl Search {
 
             // Simple alpha-beta search
             position.make_move_fast(mv);
-            let score = -self.alphabeta(position, depth - 1, -beta, -alpha, ply + 1).1;
+            let score = -self.alphabeta(position, search_depth - 1, -beta, -alpha, ply + 1).1;
             position.undo_move_fast();
 
             if score > best_score {
@@ -686,13 +818,22 @@ impl Search {
                     tt_flag = TTFlag::Lower;
 
                     // Update killer move for quiet moves
-                    if !mv.is_capture() && !mv.is_promotion() && !mv.is_castle() {
+                    if is_quiet {
                         self.killers.update(ply, mv);
-                    }
 
-                    // Update history table
-                    if let Some(piece) = position.board.get_piece(mv.from()) {
-                        self.history.update_success(color, piece.piece_type, mv.to(), depth);
+                        // Update history: success for cutoff move, failure for other searched quiets
+                        if let Some(piece) = position.board.get_piece(mv.from()) {
+                            self.history.update_success(color, piece.piece_type, mv.to(), search_depth);
+
+                            // Penalize all other quiet moves that were searched before this cutoff
+                            for &quiet_mv in &searched_quiets {
+                                if quiet_mv != mv {
+                                    if let Some(p) = position.board.get_piece(quiet_mv.from()) {
+                                        self.history.update_failure(color, p.piece_type, quiet_mv.to(), search_depth);
+                                    }
+                                }
+                            }
+                        }
                     }
 
                     break;
@@ -700,20 +841,10 @@ impl Search {
             }
         }
 
-        // Update history for moves that didn't beat alpha
-        if !best_move.is_null() && best_score < beta {
-            if let Some(piece) = position.board.get_piece(best_move.from()) {
-                // Only update for quiet moves that failed
-                if !best_move.is_capture() && !best_move.is_promotion() && !best_move.is_castle() {
-                    self.history.update_failure(color, piece.piece_type, best_move.to(), depth);
-                }
-            }
-        }
-
         // Store in TT
         self.tt
             .borrow_mut()
-            .store(position.state.hash, best_move, best_score, depth as u8, tt_flag);
+            .store(position.state.hash, best_move, best_score, search_depth as u8, tt_flag);
 
         (best_move, best_score)
     }
