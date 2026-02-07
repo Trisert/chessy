@@ -14,6 +14,7 @@ pub mod castling;
 pub mod evaluation;
 pub mod magic;
 pub mod movelist;
+pub mod moveorder;
 pub mod position;
 pub mod r#move;
 pub mod movegen;

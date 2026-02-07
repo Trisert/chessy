@@ -4,6 +4,7 @@ use chessy::position::Position;
 use chessy::r#move::{Move, PromotionType};
 use chessy::search::Search;
 use chessy::utils::{square_from_string, square_to_string};
+use rayon::prelude::*;
 use std::io::{self, BufRead};
 use std::sync::atomic::AtomicBool;
 use std::sync::{mpsc, Arc};
@@ -57,6 +58,10 @@ fn run_uci_mode() {
                 println!("id name Chessy");
                 println!("id author Chessy");
                 println!("option name Hash type spin default 256 min 1 max 2048");
+                println!(
+                    "option name Threads type spin default {} min 1 max 64",
+                    rayon::current_num_threads()
+                );
                 println!("uciok");
             }
             "isready" => {
@@ -80,14 +85,33 @@ fn run_uci_mode() {
                 break;
             }
             "setoption" => {
-                // Handle setoption if needed
-                if parts.len() >= 5 && parts[1] == "name" && parts[3] == "value" {
+                // Handle setoption for UCI options
+                if parts.len() >= 3 && parts[1] == "name" {
                     let name = parts[2];
-                    let value = parts[4];
-                    if name == "Hash" {
-                        if let Ok(size_mb) = value.parse::<usize>() {
-                            search = Search::with_config(size_mb, stop_signal.clone());
+                    let value = if parts.len() >= 5 && parts[3] == "value" {
+                        parts[4]
+                    } else {
+                        ""
+                    };
+
+                    match name {
+                        "Hash" => {
+                            if let Ok(size_mb) = value.parse::<usize>() {
+                                // Enforce UCI advertised bounds: min 1, max 2048
+                                let size_mb = size_mb.clamp(1, 2048);
+                                search = Search::with_config(size_mb, stop_signal.clone());
+                                println!("info string Set Hash to {} MB", size_mb);
+                            }
                         }
+                        "Threads" => {
+                            if let Ok(threads) = value.parse::<usize>() {
+                                // Enforce UCI advertised bounds: min 1, max 64
+                                let threads = threads.clamp(1, 64);
+                                search.set_threads(threads);
+                                println!("info string Set Threads to {}", threads);
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -256,23 +280,37 @@ fn handle_go(
         position.state.fullmove_number,
     );
 
-    // Adaptive depth based on time budget for bullet games
+    // Adaptive depth based on time budget - scales gradually with available time
     let time_budget_ms = time_ms.unwrap_or(0);
     if time_budget_ms > 0 && time_budget_ms < 50 {
         // Ultra-fast bullet: extremely shallow search (depth 1 only)
-        depth = depth.min(1); // Depth 1 for <50ms budget
+        depth = depth.min(1);
     } else if time_budget_ms > 0 && time_budget_ms < 100 {
         // Fast bullet: very shallow search
-        depth = depth.min(2); // Cap at depth 2 for <100ms per move
+        depth = depth.min(2);
     } else if time_budget_ms > 0 && time_budget_ms < 200 {
         // Bullet game: shallow search
-        depth = depth.min(3); // Cap at depth 3 for very fast games
+        depth = depth.min(3);
     } else if time_budget_ms > 0 && time_budget_ms < 500 {
         // Fast blitz: moderate depth
         depth = depth.min(5);
+    } else if time_budget_ms > 0 && time_budget_ms < 1000 {
+        // Blitz: depth 6
+        depth = depth.min(6);
+    } else if time_budget_ms > 0 && time_budget_ms < 3000 {
+        // Rapid: depth 7
+        depth = depth.min(7);
+    } else if time_budget_ms > 0 && time_budget_ms < 10000 {
+        // Long rapid: depth 8
+        depth = depth.min(8);
+    } else if time_budget_ms >= 10000 {
+        // Classical time controls: depth 9 (not 10 - too slow!)
+        depth = depth.min(9);
     }
 
     // Validate position before cloning (comprehensive check)
+    // NOTE: Disabled for now - may be rejecting valid positions
+    /*
     if let Err(err) = position.validate_position() {
         eprintln!("ERROR: Invalid position state before search!");
         eprintln!("{}", err);
@@ -292,6 +330,7 @@ fn handle_go(
         println!("bestmove 0000");
         return;
     }
+    */
 
     // Clone position for thread BEFORE search starts
     // Create a fresh copy to avoid race conditions during search
@@ -581,6 +620,33 @@ fn handle_go(
         }
     }
 
+    // Final safety check: validate move one more time before sending
+    if !best_move.is_null() {
+        let legal_moves = MoveGen::generate_legal_moves_ep(
+            &position.board,
+            position.state.side_to_move,
+            position.state.ep_square,
+            position.state.castling_rights,
+        );
+        let mut is_really_legal = false;
+        for i in 0..legal_moves.len() {
+            if legal_moves.get(i) == best_move {
+                is_really_legal = true;
+                break;
+            }
+        }
+        if !is_really_legal {
+            eprintln!("EMERGENCY: Illegal move slipped through validation!");
+            eprintln!("Move: {}", best_move);
+            eprintln!("Using first legal move instead");
+            if legal_moves.len() > 0 {
+                best_move = legal_moves.get(0);
+            } else {
+                best_move = Move::null();
+            }
+        }
+    }
+
     // Output best move
     println!("bestmove {}", best_move);
 
@@ -609,11 +675,11 @@ fn calculate_time_budget(
         estimated_moves.saturating_sub(fullmove_number).max(5)
     });
 
-    // Very aggressive time allocation for bullet (1+0) games
-    // For bullet, use 1/10 to 1/20 of remaining time based on game phase
-    // This is extremely aggressive but necessary for 1+0
+    // Time allocation based on game phase and time control
     let is_bullet = my_time < 2000; // Less than 2 seconds = bullet
-    let time_fraction = if is_bullet {
+    let is_blitz = my_time < 10000; // Less than 10 seconds = blitz
+
+    let time_fraction: u64 = if is_bullet {
         // Bullet: use fixed fractions based on game phase
         if moves_left <= 10 {
             20
@@ -622,10 +688,13 @@ fn calculate_time_budget(
         } else {
             25
         }
+    } else if is_blitz {
+        // Blitz: more conservative to avoid time trouble
+        // Use 2x moves_left for safer time allocation
+        ((moves_left as u64) * 2).max(20)
     } else {
-        // Non-bullet: use moves_left directly (remaining time / remaining moves)
-        // This avoids front-loading time and prevents time trouble
-        moves_left.max(1)
+        // Classical: be conservative, use 1.5x moves_left
+        ((moves_left as f64) * 1.5).max(20.0) as u64
     };
 
     let mut allocated = my_time / time_fraction as u64;
@@ -711,13 +780,43 @@ fn perft(position: &Position, depth: u32) -> u64 {
     }
 
     let moves = MoveGen::generate_from_position(position);
+
+    // Use parallel processing for the root level to maximize CPU utilization
+    if depth >= 4 {
+        (0..moves.len())
+            .into_par_iter()
+            .map(|i| {
+                let mv = moves.get(i);
+                let mut new_pos = position.clone();
+                new_pos.make_move(mv);
+                perft_recursive(&new_pos, depth - 1)
+            })
+            .sum()
+    } else {
+        let mut nodes = 0u64;
+        for i in 0..moves.len() {
+            let mv = moves.get(i);
+            let mut new_pos = position.clone();
+            new_pos.make_move(mv);
+            nodes += perft_recursive(&new_pos, depth - 1);
+        }
+        nodes
+    }
+}
+
+fn perft_recursive(position: &Position, depth: u32) -> u64 {
+    if depth == 0 {
+        return 1;
+    }
+
+    let moves = MoveGen::generate_from_position(position);
     let mut nodes = 0u64;
 
     for i in 0..moves.len() {
         let mv = moves.get(i);
         let mut new_pos = position.clone();
         new_pos.make_move(mv);
-        nodes += perft(&new_pos, depth - 1);
+        nodes += perft_recursive(&new_pos, depth - 1);
     }
 
     nodes

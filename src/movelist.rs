@@ -87,6 +87,14 @@ impl MoveList {
         }
     }
 
+    /// Swap two moves in the list
+    #[inline]
+    pub fn swap(&mut self, i: usize, j: usize) {
+        if i < self.len as usize && j < self.len as usize {
+            self.moves.swap(i, j);
+        }
+    }
+
     /// Check if a move exists in the list
     #[inline]
     pub fn contains(&self, mv: Move) -> bool {

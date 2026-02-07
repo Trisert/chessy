@@ -1,15 +1,17 @@
 use crate::evaluation::Evaluation;
 use crate::movegen::MoveGen;
+use crate::moveorder::{is_capture, HistoryTable, KillerTable, MovePicker, MAX_PLY};
 use crate::piece::Color;
 use crate::position::Position;
 use crate::r#move::Move;
 use crate::transposition::{TTFlag, TranspositionTable};
-use std::cell::Cell;
+use rayon::prelude::*;
+use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Search engine
+/// Search engine with parallel support
 pub struct Search {
     /// Flag to stop the search (internal)
     stop: AtomicBool,
@@ -21,8 +23,14 @@ pub struct Search {
     start_time: Cell<Instant>,
     /// Time limit (interior mutability for single-threaded access)
     time_limit: Cell<Option<Duration>>,
-    /// Transposition table
-    tt: TranspositionTable,
+    /// Transposition table (interior mutability for TT updates)
+    tt: RefCell<TranspositionTable>,
+    /// History table for quiet move ordering
+    history: HistoryTable,
+    /// Killer move table
+    killers: KillerTable,
+    /// Number of threads for parallel search
+    threads: usize,
 }
 
 impl Search {
@@ -34,7 +42,10 @@ impl Search {
             nodes: AtomicU64::new(0),
             start_time: Cell::new(Instant::now()),
             time_limit: Cell::new(None),
-            tt: TranspositionTable::new(256), // 256 MB TT
+            tt: RefCell::new(TranspositionTable::new(256)), // 256 MB TT
+            history: HistoryTable::new(),
+            killers: KillerTable::new(),
+            threads: rayon::current_num_threads(),
         }
     }
 
@@ -46,7 +57,10 @@ impl Search {
             nodes: AtomicU64::new(0),
             start_time: Cell::new(Instant::now()),
             time_limit: Cell::new(None),
-            tt: TranspositionTable::new(256),
+            tt: RefCell::new(TranspositionTable::new(256)),
+            history: HistoryTable::new(),
+            killers: KillerTable::new(),
+            threads: rayon::current_num_threads(),
         }
     }
 
@@ -58,7 +72,10 @@ impl Search {
             nodes: AtomicU64::new(0),
             start_time: Cell::new(Instant::now()),
             time_limit: Cell::new(None),
-            tt: TranspositionTable::new(tt_size_mb),
+            tt: RefCell::new(TranspositionTable::new(tt_size_mb)),
+            history: HistoryTable::new(),
+            killers: KillerTable::new(),
+            threads: rayon::current_num_threads(),
         }
     }
 
@@ -70,13 +87,26 @@ impl Search {
             nodes: AtomicU64::new(0),
             start_time: Cell::new(Instant::now()),
             time_limit: Cell::new(None),
-            tt: TranspositionTable::new(tt_size_mb),
+            tt: RefCell::new(TranspositionTable::new(tt_size_mb)),
+            history: HistoryTable::new(),
+            killers: KillerTable::new(),
+            threads: rayon::current_num_threads(),
         }
+    }
+
+    /// Set the number of threads
+    pub fn set_threads(&mut self, threads: usize) {
+        self.threads = threads.max(1);
+    }
+
+    /// Get the number of threads
+    pub fn threads(&self) -> usize {
+        self.threads
     }
 
     /// Get the TT size in MB
     pub fn tt_size_mb(&self) -> usize {
-        self.tt.size_mb()
+        self.tt.borrow().size_mb()
     }
 
     /// Set external stop signal (for use in spawned threads)
@@ -86,6 +116,222 @@ impl Search {
 
     /// Run an iterative deepening search
     pub fn search(&mut self, position: &Position, depth: u32, time_ms: Option<u64>) -> (Move, i32) {
+        if self.threads > 1 {
+            self.search_parallel(position, depth, time_ms)
+        } else {
+            self.search_single_thread(position, depth, time_ms)
+        }
+    }
+
+    /// Single-threaded search
+    fn search_single_thread(
+        &mut self,
+        position: &Position,
+        depth: u32,
+        time_ms: Option<u64>,
+    ) -> (Move, i32) {
+        self.search_internal(position, depth, time_ms, false)
+    }
+
+    /// Parallel search using rayon
+    fn search_parallel(
+        &mut self,
+        position: &Position,
+        depth: u32,
+        time_ms: Option<u64>,
+    ) -> (Move, i32) {
+        // Reset search state
+        self.stop.store(false, Ordering::Relaxed);
+        self.nodes.store(0, Ordering::Relaxed);
+        self.start_time.set(Instant::now());
+        self.time_limit.set(time_ms.map(Duration::from_millis));
+
+        // New search generation for TT
+        self.tt.borrow_mut().new_generation();
+
+        // Clear history and killers for new search
+        self.history.clear();
+        self.killers.clear();
+
+        // Get legal moves first
+        let legal_moves = MoveGen::generate_legal_moves_ep(
+            &position.board,
+            position.state.side_to_move,
+            position.state.ep_square,
+            position.state.castling_rights,
+        );
+
+        // No legal moves - checkmate or stalemate
+        if legal_moves.is_empty() {
+            let king_sq = match position.board.king_square(position.state.side_to_move) {
+                Some(sq) => sq,
+                None => return (Move::null(), -32000),
+            };
+
+            let in_check = MoveGen::is_square_attacked(
+                &position.board,
+                king_sq,
+                position.state.side_to_move.flip(),
+            );
+
+            if in_check {
+                return (Move::null(), -32000);
+            } else {
+                return (Move::null(), 0);
+            }
+        }
+
+        let mut best_move = Move::null();
+        let mut best_score = 0;
+
+        // Iterative deepening
+        for d in 1..=depth {
+            if self.should_stop() {
+                break;
+            }
+
+            // For parallel search, split root moves among threads
+            let depth_best = self.search_root_parallel(position, d, &legal_moves);
+
+            if self.should_stop() {
+                break;
+            }
+
+            if let Some((mv, score)) = depth_best {
+                // Validate the move
+                let mut mv_is_legal = false;
+                for i in 0..legal_moves.len() {
+                    if legal_moves.get(i) == mv {
+                        mv_is_legal = true;
+                        break;
+                    }
+                }
+
+                if mv_is_legal {
+                    best_move = mv;
+                    best_score = score;
+
+                    // Print UCI info
+                    let elapsed = self.start_time.get().elapsed();
+                    let nodes = self.nodes.load(Ordering::Relaxed);
+                    let nps = if elapsed.as_secs_f64() > 0.0 {
+                        nodes as f64 / elapsed.as_secs_f64()
+                    } else {
+                        0.0
+                    };
+
+                    let stats = self.tt.borrow().stats();
+                    println!(
+                        "info depth {} score cp {} nodes {} nps {:.0} time {} hashfull {}",
+                        d,
+                        score,
+                        nodes,
+                        nps,
+                        elapsed.as_millis(),
+                        stats.hashfull
+                    );
+                }
+            }
+        }
+
+        // Final validation
+        if best_move.is_null() {
+            best_move = legal_moves.get(0);
+        } else {
+            let mut move_is_legal = false;
+            for i in 0..legal_moves.len() {
+                if legal_moves.get(i) == best_move {
+                    move_is_legal = true;
+                    break;
+                }
+            }
+            if !move_is_legal {
+                best_move = legal_moves.get(0);
+            }
+        }
+
+        (best_move, best_score)
+    }
+
+    /// Search root position in parallel using Lazy SMP
+    fn search_root_parallel(
+        &self,
+        position: &Position,
+        depth: u32,
+        legal_moves: &crate::movelist::MoveList,
+    ) -> Option<(Move, i32)> {
+        let num_moves = legal_moves.len();
+        if num_moves == 0 {
+            return None;
+        }
+
+        // Extract data we need before entering parallel section
+        let stop_signal = self
+            .external_stop
+            .clone()
+            .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+        let start_time = self.start_time.get();
+        let time_limit = self.time_limit.get();
+        let _tt_size = self.tt.borrow().size_mb();
+
+        // Convert moves to a vector for parallel processing
+        let moves: Vec<Move> = (0..num_moves).map(|i| legal_moves.get(i)).collect();
+
+        // Use thread-local results
+        let results: Vec<(Move, i32)> = moves
+            .par_iter()
+            .filter_map(|&mv| {
+                // Check stop signal
+                if stop_signal.load(Ordering::Relaxed) {
+                    return None;
+                }
+
+                // Check time limit before starting work
+                if let Some(limit) = time_limit {
+                    let effective_limit = limit.mul_f64(0.95);
+                    if start_time.elapsed() >= effective_limit {
+                        return None;
+                    }
+                }
+
+                // Clone position for this thread
+                let mut thread_pos = position.clone();
+
+                // Make the move
+                thread_pos.make_move(mv);
+
+                // Create a thread-local search instance
+                let mut thread_search = Search::with_stop_signal(stop_signal.clone());
+
+                // Set time tracking
+                thread_search.start_time.set(start_time);
+                thread_search.time_limit.set(time_limit);
+
+                // Search this line - alphabeta checks time internally via should_stop()
+                let (_, score) =
+                    thread_search.alphabeta(&mut thread_pos, depth - 1, -32000, 32000, 1);
+                let score = -score; // Negate for the other side's perspective
+
+                Some((mv, score))
+            })
+            .collect();
+
+        // Update total node count
+        let total_nodes: u64 = results.len() as u64 * 1000; // Estimate
+        self.nodes.fetch_add(total_nodes, Ordering::Relaxed);
+
+        // Find best result
+        results.into_iter().max_by_key(|(_, score)| *score)
+    }
+
+    /// Internal search implementation
+    fn search_internal(
+        &mut self,
+        position: &Position,
+        depth: u32,
+        time_ms: Option<u64>,
+        _parallel: bool,
+    ) -> (Move, i32) {
         // Debug: Validate position before search
         if let Err(err) = position.board.validate() {
             eprintln!("=== INVALID POSITION AT SEARCH START ===");
@@ -101,7 +347,11 @@ impl Search {
         self.time_limit.set(time_ms.map(Duration::from_millis));
 
         // New search generation for TT
-        self.tt.new_generation();
+        self.tt.borrow_mut().new_generation();
+
+        // Clear history and killers for new search
+        self.history.clear();
+        self.killers.clear();
 
         let mut best_move = Move::null();
         let mut best_score = 0;
@@ -142,7 +392,7 @@ impl Search {
 
             // Clone position for this depth iteration (alphabeta uses make_move_fast/undo_move_fast)
             let mut search_position = position.clone();
-            let (mv, score) = self.alphabeta(&mut search_position, d, -32000, 32000);
+            let (mv, score) = self.alphabeta(&mut search_position, d, -32000, 32000, 0);
 
             // Check time after each depth iteration for bullet games
             // This is crucial for 1+0 bullet where each move must be very fast
@@ -176,7 +426,7 @@ impl Search {
                     0.0
                 };
 
-                let stats = self.tt.stats();
+                let stats = self.tt.borrow().stats();
                 println!(
                     "info depth {} score cp {} nodes {} nps {:.0} time {} hashfull {}",
                     d,
@@ -210,187 +460,262 @@ impl Search {
         (best_move, best_score)
     }
 
-    /// Alpha-beta search
-    fn alphabeta(&self, position: &mut Position, depth: u32, mut alpha: i32, beta: i32) -> (Move, i32) {
+    /// Check if a move is legal using fast validation
+    /// Returns Option<bool> where None means we couldn't determine legality quickly
+    /// and Some(bool) is the actual result - this allows caching of the result
+    fn is_move_legal_optimized(position: &Position, mv: Move) -> bool {
+        // First check if move is pseudo-legal
+        if !MoveGen::is_pseudo_legal(
+            &position.board,
+            mv,
+            position.state.side_to_move,
+            position.state.ep_square,
+            position.state.castling_rights,
+        ) {
+            return false;
+        }
+        // Then check if it leaves king in check
+        MoveGen::is_move_legal(position, mv, position.state.side_to_move)
+    }
+
+    /// Quiescent search - extends search through captures and checks at leaf nodes
+    /// This prevents the "horizon effect" where the engine makes bad moves
+    /// because it doesn't see tactical sequences just beyond the search depth
+    fn quiescent(
+        &mut self,
+        position: &mut Position,
+        mut alpha: i32,
+        beta: i32,
+        ply: usize,
+    ) -> i32 {
+        if self.should_stop() {
+            return 0;
+        }
+
+        // Limit quiescent search depth to prevent stack overflow
+        if ply >= 10 {
+            // At max depth, return static evaluation
+            let static_eval = Evaluation::evaluate(&position.board);
+            return if position.state.side_to_move == Color::White {
+                static_eval
+            } else {
+                -static_eval
+            };
+        }
+
+        let color = position.state.side_to_move;
+
+        // Stand pat: use static evaluation as a lower bound
+        let static_eval = Evaluation::evaluate(&position.board);
+        let eval = if color == Color::White {
+            static_eval
+        } else {
+            -static_eval
+        };
+
+        if eval >= beta {
+            return beta;
+        }
+
+        if eval > alpha {
+            alpha = eval;
+        }
+
+        // Generate captures only for quiescent search
+        let mut move_picker = MovePicker::new_quiescent(position);
+
+        let mut move_count = 0;
+
+        while let Some(mv) = move_picker.next_move() {
+            move_count += 1;
+
+            // Delta pruning: if capture can't improve alpha enough, skip it
+            // (unless it's a promotion which can be worth much more)
+            if !mv.is_promotion() {
+                let captured_value = match position.board.get_piece(mv.to()) {
+                    Some(piece) => match piece.piece_type {
+                        crate::piece::PieceType::Pawn => 100,
+                        crate::piece::PieceType::Knight => 320,
+                        crate::piece::PieceType::Bishop => 330,
+                        crate::piece::PieceType::Rook => 500,
+                        crate::piece::PieceType::Queen => 900,
+                        crate::piece::PieceType::King => 0,
+                    },
+                    None => 0,
+                };
+
+                // If even with the captured piece we can't exceed alpha by a queen, skip
+                if eval + captured_value + 900 < alpha {
+                    continue;
+                }
+            }
+
+            position.make_move_fast(mv);
+            let score = -self.quiescent(position, -beta, -alpha, ply + 1);
+            position.undo_move_fast();
+
+            if score >= beta {
+                return beta;
+            }
+
+            if score > alpha {
+                alpha = score;
+            }
+        }
+
+        alpha
+    }
+
+    /// Alpha-beta search - SIMPLIFIED FOR DEBUGGING
+    fn alphabeta(
+        &mut self,
+        position: &mut Position,
+        depth: u32,
+        alpha: i32,
+        beta: i32,
+        ply: usize,
+    ) -> (Move, i32) {
+        // Prevent stack overflow
+        if ply > 100 {
+            return (Move::null(), alpha);
+        }
+
         if self.should_stop() {
             return (Move::null(), 0);
         }
 
         let color = position.state.side_to_move;
 
-        // Generate legal moves first (needed for TT validation)
-        let moves = MoveGen::generate_legal_moves_ep(
-            &position.board,
-            color,
-            position.state.ep_square,
-            position.state.castling_rights,
+        // Get TT move for move ordering
+        let tt_entry = self.tt.borrow().probe(position.state.hash);
+        let tt_move = tt_entry.map(|e| e.best_move());
+
+        // Validate TT move
+        let validated_tt_move = tt_move.and_then(|mv| {
+            if Self::is_move_legal_optimized(position, mv) {
+                Some(mv)
+            } else {
+                None
+            }
+        });
+
+        // Create move picker with history and killer tables
+        let mut move_picker = MovePicker::new(
+            position,
+            validated_tt_move,
+            ply,
+            Some(&self.history),
+            Some(&self.killers),
         );
 
-        // No legal moves - checkmate or stalemate
-        if moves.is_empty() {
-            // Check if king is in check
+        // No legal moves
+        if move_picker.is_empty() {
             let king_sq = match position.board.king_square(color) {
                 Some(sq) => sq,
-                None => return (Move::null(), -32000), // King captured
+                None => return (Move::null(), -32000),
             };
 
             let in_check = MoveGen::is_square_attacked(&position.board, king_sq, color.flip());
 
             if in_check {
-                // Checkmate
                 return (Move::null(), -32000 + (depth as i32));
             } else {
-                // Stalemate
                 return (Move::null(), 0);
             }
         }
 
-        // Check transposition table
-        if let Some(entry) = self.tt.probe(position.state.hash) {
-            if entry.depth >= depth as u8 {
-                // Verify TT move is actually legal before returning
-                let tt_move = entry.best_move;
-
-                // Check if it's in our generated legal moves list
-                let mut tt_move_legal = false;
-                for i in 0..moves.len() {
-                    if moves.get(i) == tt_move {
-                        tt_move_legal = true;
-                        break;
-                    }
-                }
-
-                if tt_move_legal {
-                    // Use standard TT cutoff logic - trust entries at sufficient depth
-                    match entry.flag {
-                        TTFlag::Exact => {
-                            return (tt_move, entry.score);
-                        }
+        // TT cutoff
+        if let Some(entry) = tt_entry {
+            if entry.depth() >= depth as u8 {
+                let tt_mv = entry.best_move();
+                if Self::is_move_legal_optimized(position, tt_mv) {
+                    match entry.flag() {
+                        TTFlag::Exact => return (tt_mv, entry.score()),
                         TTFlag::Lower => {
-                            if entry.score >= beta {
-                                return (tt_move, entry.score);
+                            if entry.score() >= beta {
+                                return (tt_mv, entry.score());
                             }
-                            // Tighten alpha bound
-                            if entry.score > alpha {
-                                alpha = entry.score;
+                            if entry.score() > alpha {
+                                return (tt_mv, entry.score());
                             }
                         }
                         TTFlag::Upper => {
-                            if entry.score <= alpha {
-                                return (tt_move, entry.score);
+                            if entry.score() <= alpha {
+                                return (tt_mv, entry.score());
                             }
-                            // Could tighten beta bound here, but beta is not mutable
-                            // We could use the entry for move ordering though
                         }
                     }
                 }
             }
         }
 
-        // Leaf node
+        // Leaf node - use quiescent search to extend through captures/checks
         if depth == 0 {
             let nodes = self.nodes.fetch_add(1, Ordering::Relaxed);
             if nodes % 1000000 == 0 {
                 self.print_info();
             }
-            let score = Evaluation::evaluate(&position.board);
-            return (
-                Move::null(),
-                if color == Color::White { score } else { -score },
-            );
+            // Use quiescent search to avoid horizon effect
+            let score = self.quiescent(position, alpha, beta, ply);
+            return (Move::null(), score);
         }
 
         let mut best_move = Move::null();
+        let mut best_score = alpha;
         let mut tt_flag = TTFlag::Upper;
+        let mut move_count = 0;
 
-        for i in 0..moves.len() {
-            // Check time frequently (every move) for bullet chess responsiveness
-            // Note: This involves atomic loads but is crucial for 1+0 bullet where
-            // each move must complete very quickly. The overhead is negligible compared
-            // to the search work done at each node.
+        while let Some(mv) = move_picker.next_move() {
+            move_count += 1;
+
             if self.should_stop() {
-                // If we haven't found a best_move yet, use the first move as fallback
-                // This ensures we never return Move::null() when legal moves exist
-                if best_move.is_null() && moves.len() > 0 {
-                    best_move = moves.get(0);
-                }
                 break;
             }
 
-            let mv = moves.get(i);
-
-            // Make move using fast do/unmake
+            // Simple alpha-beta search
             position.make_move_fast(mv);
-
-            // Search with negated score
-            let (_, score) = self.alphabeta(position, depth - 1, -beta, -alpha);
-
-            // Negate score for opponent's perspective
-            let score = -score;
-
-            // Undo the move
+            let score = -self.alphabeta(position, depth - 1, -beta, -alpha, ply + 1).1;
             position.undo_move_fast();
 
-            if score > alpha {
-                alpha = score;
+            if score > best_score {
+                best_score = score;
                 best_move = mv;
                 tt_flag = TTFlag::Exact;
-            }
 
-            if alpha >= beta {
-                tt_flag = TTFlag::Lower;
-                break; // Beta cutoff
-            }
-        }
+                if best_score >= beta {
+                    tt_flag = TTFlag::Lower;
 
-        // Don't store partial results from aborted searches - they may contain
-        // incorrect scores from early-exit returns of (Move::null(), 0)
-        if self.should_stop() {
-            return (best_move, alpha);
-        }
+                    // Update killer move for quiet moves
+                    if !mv.is_capture() && !mv.is_promotion() && !mv.is_castle() {
+                        self.killers.update(ply, mv);
+                    }
 
-        // Store in transposition table
-        // Only store if we have a valid best_move, unless it's an upper bound (where null move is OK)
-        if !best_move.is_null() || tt_flag == TTFlag::Upper {
-            self.tt
-                .store(position.state.hash, best_move, alpha, depth as u8, tt_flag);
-        }
+                    // Update history table
+                    if let Some(piece) = position.board.get_piece(mv.from()) {
+                        self.history.update_success(color, piece.piece_type, mv.to(), depth);
+                    }
 
-        // Final validation: ensure best_move is actually legal
-        if !best_move.is_null() {
-            let mut move_is_legal = false;
-            for i in 0..moves.len() {
-                if moves.get(i) == best_move {
-                    move_is_legal = true;
                     break;
                 }
             }
-            if !move_is_legal {
-                // Debug: This should never happen if our search is working correctly
-                eprintln!(
-                    "WARNING: Alpha-beta returned illegal move {} at depth {}",
-                    best_move, depth
-                );
-                eprintln!("Available legal moves: {}", moves.len());
+        }
 
-                // If best_move is not legal, return the first legal move instead
-                if moves.len() > 0 {
-                    best_move = moves.get(0);
-                    eprintln!("Fallback: Using first legal move {}", best_move);
-                } else {
-                    best_move = Move::null();
-                    eprintln!("Fallback: No legal moves available");
+        // Update history for moves that didn't beat alpha
+        if !best_move.is_null() && best_score < beta {
+            if let Some(piece) = position.board.get_piece(best_move.from()) {
+                // Only update for quiet moves that failed
+                if !best_move.is_capture() && !best_move.is_promotion() && !best_move.is_castle() {
+                    self.history.update_failure(color, piece.piece_type, best_move.to(), depth);
                 }
             }
         }
 
-        // Final fallback: if best_move is still null but we have legal moves,
-        // use the first one (this can happen if search was aborted before finding any move)
-        if best_move.is_null() && moves.len() > 0 {
-            best_move = moves.get(0);
-        }
+        // Store in TT
+        self.tt
+            .borrow_mut()
+            .store(position.state.hash, best_move, best_score, depth as u8, tt_flag);
 
-        (best_move, alpha)
+        (best_move, best_score)
     }
 
     /// Check if search should stop

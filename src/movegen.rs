@@ -215,7 +215,7 @@ impl MoveGen {
         let from_file = file_of(from);
         let to_file = file_of(to);
 
-        let (start_rank, promotion_rank, forward): (Rank, Rank, i8) = match color {
+        let (start_rank, promotion_rank, _forward): (Rank, Rank, i8) = match color {
             Color::White => (RANK_2, RANK_8, 8),
             Color::Black => (RANK_7, RANK_1, -8i8),
         };
@@ -619,7 +619,7 @@ impl MoveGen {
         }
     }
 
-    /// Generate king moves
+    /// Generate king moves (pseudo-legal)
     fn generate_king_moves(board: &Board, color: Color, moves: &mut MoveList) {
         let king = board.piece_bb(PieceType::King, color);
         let not_occupied = board.empty();
@@ -629,24 +629,9 @@ impl MoveGen {
             let attacks = Self::king_attacks(from);
             let targets = attacks & (not_occupied | opponent_pieces);
             for to in targets.squares() {
-                // Don't generate moves that would leave the king in check
-                // Make a temporary move and check if the king would be in check
-                let mut test_board = board.clone();
-                if let Some(king_piece) = test_board.get_piece(from) {
-                    test_board.remove_piece(king_piece, from);
-
-                    // Handle capture
-                    if let Some(captured) = test_board.get_piece(to) {
-                        test_board.remove_piece(captured, to);
-                    }
-
-                    test_board.set_piece(king_piece, to);
-
-                    // Check if the king is in check after the move
-                    if !Self::is_square_attacked(&test_board, to, color.flip()) {
-                        moves.push(Move::new(from, to));
-                    }
-                }
+                // Generate all pseudo-legal king moves
+                // Legality (king safety) is checked later when filtering pseudo-legal to legal
+                moves.push(Move::new(from, to));
             }
         }
     }
@@ -694,7 +679,7 @@ impl MoveGen {
     }
 
     /// King attacks from a square
-    fn king_attacks(sq: Square) -> Bitboard {
+    pub fn king_attacks(sq: Square) -> Bitboard {
         const KING_DELTAS: [i8; 8] = [-9, -8, -7, -1, 1, 7, 8, 9];
         let mut attacks = Bitboard::EMPTY;
 
@@ -953,5 +938,17 @@ mod tests {
 
         // Should have 20 moves from start position
         assert_eq!(moves.len(), 20);
+    }
+
+    #[test]
+    fn test_no_e2d3_move() {
+        let board = Board::from_start();
+        let moves = MoveGen::generate_moves(&board, Color::White);
+
+        // e2d3 should NOT be in the move list (illegal pawn move)
+        for i in 0..moves.len() {
+            let mv = moves.get(i);
+            assert_ne!(mv.to_string(), "e2d3", "e2d3 should not be a valid move from start position");
+        }
     }
 }
