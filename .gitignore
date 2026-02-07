@@ -16,3 +16,6 @@ test_king
 test_king.cperf.data*
 perf.data*
 *.data
+perf.data.old
+perf.data
+perf.data.old

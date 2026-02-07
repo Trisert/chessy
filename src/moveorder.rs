@@ -354,7 +354,6 @@ pub struct MovePicker {
     scores: Vec<i32>,
     index: usize,
     tt_move: Option<Move>,
-    ply: usize,
     history_scores: Vec<i32>,
     killer_scores: Vec<i32>,
 }
@@ -406,7 +405,6 @@ impl MovePicker {
             scores: Vec::with_capacity(256),
             index: 0,
             tt_move,
-            ply,
             history_scores,
             killer_scores,
         };
@@ -451,7 +449,6 @@ impl MovePicker {
             scores: Vec::with_capacity(256),
             index: 0,
             tt_move: None,
-            ply: 0,
             history_scores: vec![0; num_moves],
             killer_scores: vec![0; num_moves],
         };
@@ -528,64 +525,6 @@ impl MovePicker {
             self.scores.push(score);
         }
     }
-
-/// Simplified move scoring without history/killers (for internal use)
-fn score_move_simple(
-    board: &Board,
-    side_to_move: Color,
-    mv: Move,
-    tt_move: Option<Move>,
-) -> i32 {
-    // TT move gets highest priority
-    if let Some(tt) = tt_move {
-        if mv == tt {
-            return 1_000_000;
-        }
-    }
-
-    // Check if this is a capture
-    let is_cap = is_capture(board, side_to_move, mv);
-
-    // Promotions (queen promotions are very valuable)
-    if mv.is_promotion() {
-        // Check promotion type directly from move encoding
-        let promo = (mv.0 >> 12) & 0x7;
-        if promo >= 4 {
-            match promo - 4 {
-                0 => return 950_000, // Queen
-                1 => return 850_000, // Rook
-                2 => return 800_000, // Bishop
-                3 => return 750_000, // Knight
-                _ => {}
-            }
-        }
-    }
-
-    // Castling is good
-    if mv.is_castle() {
-        return 600_000;
-    }
-
-    // Captures: use SEE to classify as winning or losing
-    if is_cap {
-        let see_score = see(board, mv);
-        if see_score >= 0 {
-            // Winning capture: base MVV-LVA + bonus
-            return 400_000 + mvv_lva_score(
-                captured_piece_type(board, side_to_move, mv).unwrap_or(PieceType::Pawn),
-                board.get_piece(mv.from())
-                    .map(|p| p.piece_type)
-                    .unwrap_or(PieceType::Pawn),
-            );
-        } else {
-            // Losing capture: negative score
-            return -100_000 + see_score;
-        }
-    }
-
-    // Default quiet move score
-    0
-}
 
     /// Get the next move (returns None when exhausted)
     pub fn next_move(&mut self) -> Option<Move> {
