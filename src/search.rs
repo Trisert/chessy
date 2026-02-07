@@ -410,7 +410,7 @@ impl Search {
         let moves: Vec<Move> = (0..num_moves).map(|i| legal_moves.get(i)).collect();
 
         // Use thread-local results
-        let results: Vec<(Move, i32)> = moves
+        let results: Vec<(Move, i32, u64)> = moves
             .par_iter()
             .filter_map(|&mv| {
                 // Check stop signal
@@ -444,19 +444,19 @@ impl Search {
                     thread_search.alphabeta(&mut thread_pos, depth - 1, -32000, 32000, 1);
                 let score = -score; // Negate for the other side's perspective
 
-                Some((mv, score))
+                // Get the node count from this thread
+                let nodes = thread_search.nodes();
+
+                Some((mv, score, nodes))
             })
             .collect();
 
-        // Update total node count
-        // TODO: This is an inaccurate estimate. The proper fix requires each thread-local
-        // Search instance to track and return its actual node count. For now, we use a rough
-        // estimate based on the number of moves searched.
-        let total_nodes: u64 = results.len() as u64 * 1000; // Rough estimate
+        // Update total node count with accurate sum
+        let total_nodes: u64 = results.iter().map(|(_, _, nodes)| nodes).sum();
         self.nodes.fetch_add(total_nodes, Ordering::Relaxed);
 
         // Find best result
-        results.into_iter().max_by_key(|(_, score)| *score)
+        results.into_iter().max_by_key(|(_, score, _)| *score).map(|(mv, score, _)| (mv, score))
     }
 
     /// Internal search implementation
