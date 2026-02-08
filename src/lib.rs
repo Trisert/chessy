@@ -24,6 +24,17 @@ pub mod transposition;
 pub mod utils;
 pub mod zobrist;
 
+use std::sync::Once;
+
+static INIT: Once = Once::new();
+
+/// Initialize magic bitboard attack tables. Safe to call multiple times.
+pub fn init() {
+    INIT.call_once(|| {
+        magic::init_attack_table();
+    });
+}
+
 // Re-export commonly used types
 pub use bitboard::Bitboard;
 pub use board::Board;

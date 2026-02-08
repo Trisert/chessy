@@ -718,6 +718,41 @@ impl Position {
         self.state.side_to_move = color;
     }
 
+    /// Make a null move (pass the turn without moving)
+    /// Used for null move pruning in search
+    /// Returns the old EP square for undo
+    pub fn make_null_move_fast(&mut self) -> Option<Square> {
+        let old_ep = self.state.ep_square;
+        
+        // Update hash for side to move
+        self.update_hash_side_to_move();
+        
+        // Update hash for EP square change (clear it)
+        self.update_hash_en_passant(old_ep, None);
+        
+        // Flip side to move
+        self.state.side_to_move = self.state.side_to_move.flip();
+        
+        // Clear en passant square (can't capture en passant after null move)
+        self.state.ep_square = None;
+        
+        old_ep
+    }
+
+    /// Undo a null move
+    /// Takes the old EP square returned by make_null_move_fast
+    pub fn undo_null_move_fast(&mut self, old_ep: Option<Square>) {
+        // Flip side to move back
+        self.state.side_to_move = self.state.side_to_move.flip();
+        
+        // Update hash for side to move (flip back)
+        self.update_hash_side_to_move();
+        
+        // Restore en passant square
+        self.update_hash_en_passant(None, old_ep);
+        self.state.ep_square = old_ep;
+    }
+
     /// Check for threefold repetition
     pub fn is_threefold_repetition(&self) -> bool {
         let current_hash = self.state.hash;
@@ -1234,8 +1269,13 @@ impl Position {
 mod tests {
     use super::*;
 
+    fn init_magic() {
+        crate::magic::init_attack_table();
+    }
+
     #[test]
     fn test_position_from_start() {
+        init_magic();
         let pos = Position::from_start();
 
         assert_eq!(pos.state.side_to_move, Color::White);

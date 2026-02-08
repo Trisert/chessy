@@ -520,6 +520,43 @@ impl MovePicker {
                 if score == 0 && self.history_scores[i] > 0 {
                     score = self.history_scores[i];
                 }
+                
+                // PST-based move ordering for quiet moves without history
+                // This prioritizes central pawn moves (d4, e4) over edge moves (a3, b3)
+                if score == 0 {
+                    let to = mv.to();
+                    let from = mv.from();
+                    if let Some(piece) = board.get_piece(from) {
+                        // PST bonus based on destination square
+                        let to_rank = (to / 8) as i32;
+                        let to_file = (to % 8) as i32;
+                        
+                        // Center control bonus (d4, e4, d5, e5 are best)
+                        let center_dist = ((to_file - 3).abs() + (to_file - 4).abs()).min(1)
+                                        + ((to_rank - 3).abs() + (to_rank - 4).abs()).min(1);
+                        let center_bonus = (4 - center_dist) * 100; // Up to 400
+                        
+                        // Pawn advancement bonus
+                        let pawn_bonus = if piece.piece_type == PieceType::Pawn {
+                            // Flip rank for black pawns
+                            let rank = if side_to_move == Color::White { to_rank } else { 7 - to_rank };
+                            rank * 50 // Encourage pawn advancement
+                        } else {
+                            0
+                        };
+                        
+                        // Development bonus for knights/bishops moving off back rank
+                        let dev_bonus = if piece.piece_type == PieceType::Knight || piece.piece_type == PieceType::Bishop {
+                            let from_rank = (from / 8) as i32;
+                            let from_rank_adj = if side_to_move == Color::White { from_rank } else { 7 - from_rank };
+                            if from_rank_adj == 0 { 200 } else { 0 } // Bonus for leaving back rank
+                        } else {
+                            0
+                        };
+                        
+                        score = center_bonus + pawn_bonus + dev_bonus;
+                    }
+                }
             }
 
             self.scores.push(score);

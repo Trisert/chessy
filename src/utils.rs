@@ -278,7 +278,7 @@ mod tests {
         // Flip H1 (7) -> H8 (63)
         assert_eq!(flip_square(7), 63);
 
-        // Flip e4 (28) -> e5 (35)
-        assert_eq!(flip_square(28), 35);
+        // Flip e4 (28) -> e5 (36): 28 ^ 56 = 36
+        assert_eq!(flip_square(28), 36);
     }
 }

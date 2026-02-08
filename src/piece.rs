@@ -119,8 +119,9 @@ mod tests {
         assert_eq!(piece.color, Color::White);
         assert_eq!(piece.piece_type, PieceType::Pawn);
 
+        // Index 7: color = Black (7 >= 6), piece_type = 7 % 6 = 1 = Knight
         let piece = Piece::from_index(7);
         assert_eq!(piece.color, Color::Black);
-        assert_eq!(piece.piece_type, PieceType::Bishop);
+        assert_eq!(piece.piece_type, PieceType::Knight);
     }
 }

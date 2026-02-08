@@ -519,20 +519,57 @@ impl Search {
             }
         }
 
-        // Iterative deepening
+        // Iterative deepening with aspiration windows
+        let mut prev_score = 0i32;
+        const INITIAL_WINDOW: i32 = 25; // Start with ±25 centipawns
+        
         for d in 1..=depth {
             if self.should_stop() {
                 break;
             }
 
-            // Clone position for this depth iteration (alphabeta uses make_move_fast/undo_move_fast)
+            // Set up aspiration window based on previous score
+            // Use wider window for first few depths since score is unstable
+            let (mut alpha, mut beta) = if d >= 4 && prev_score.abs() < 30000 {
+                (prev_score - INITIAL_WINDOW, prev_score + INITIAL_WINDOW)
+            } else {
+                (-32000, 32000)
+            };
+            
             let mut search_position = position.clone();
-            let (mv, score) = self.alphabeta(&mut search_position, d, -32000, 32000, 0);
+            let mut mv;
+            let mut score;
+            
+            // Aspiration window loop - widen window on fail
+            loop {
+                (mv, score) = self.alphabeta(&mut search_position, d, alpha, beta, 0);
+                
+                if self.should_stop() {
+                    break;
+                }
+                
+                // Check if score is within window
+                if score <= alpha {
+                    // Fail-low: widen alpha (search again with wider window)
+                    alpha = (alpha - INITIAL_WINDOW * 2).max(-32000);
+                    search_position = position.clone(); // Reset position
+                } else if score >= beta {
+                    // Fail-high: widen beta
+                    beta = (beta + INITIAL_WINDOW * 2).min(32000);
+                    search_position = position.clone(); // Reset position
+                } else {
+                    // Score is within window - we're done
+                    break;
+                }
+                
+                // If window is now full, break to avoid infinite loop
+                if alpha <= -32000 && beta >= 32000 {
+                    break;
+                }
+            }
 
             // Check time after each depth iteration for bullet games
-            // This is crucial for 1+0 bullet where each move must be very fast
             if self.should_stop() {
-                // Don't use this iteration's result if we're out of time
                 break;
             }
 
@@ -543,6 +580,7 @@ impl Search {
             if mv_is_legal {
                 best_move = mv;
                 best_score = score;
+                prev_score = score; // Update for next iteration's aspiration window
 
                 // Print UCI info
                 let elapsed = self.start_time.get().elapsed();
@@ -775,6 +813,42 @@ impl Search {
             }
         }
 
+        // Null Move Pruning
+        // If we're not in check and have enough depth, try giving the opponent a free move
+        // If they still can't beat beta, this position is likely very good for us
+        const NULL_MOVE_REDUCTION: u32 = 3; // R = 3 is standard
+        const NULL_MOVE_MIN_DEPTH: u32 = 3; // Don't do NMP at low depths
+        
+        if !in_check && search_depth >= NULL_MOVE_MIN_DEPTH && beta < 30000 && beta > -30000 {
+            // Additional safety: don't do null move in zugzwang-prone endgames
+            // Simple heuristic: require at least one non-pawn piece
+            let our_pieces = position.board.color_bb(color);
+            let our_pawns = position.board.piece_bb(crate::piece::PieceType::Pawn, color);
+            let our_king = position.board.piece_bb(crate::piece::PieceType::King, color);
+            let non_pawn_pieces = (our_pieces.as_u64() ^ our_pawns.as_u64() ^ our_king.as_u64()).count_ones();
+            
+            if non_pawn_pieces > 0 {
+                // Make null move
+                let old_ep = position.make_null_move_fast();
+                
+                // Search with reduced depth
+                let null_depth = search_depth.saturating_sub(NULL_MOVE_REDUCTION + 1);
+                let (_, null_score) = self.alphabeta(position, null_depth, -beta, -beta + 1, ply + 1);
+                let null_score = -null_score;
+                
+                // Undo null move
+                position.undo_null_move_fast(old_ep);
+                
+                // If the null move search still beats beta, this position is likely good
+                if null_score >= beta {
+                    // Don't return mate scores from null move
+                    if null_score < 30000 {
+                        return (Move::null(), beta);
+                    }
+                }
+            }
+        }
+
         // Leaf node - use quiescent search to extend through captures/checks
         if search_depth == 0 {
             let nodes = self.nodes.fetch_add(1, Ordering::Relaxed);
@@ -786,10 +860,25 @@ impl Search {
             return (Move::null(), score);
         }
 
+        // Futility pruning setup
+        // At low depths, if static eval is far below alpha, quiet moves are unlikely to help
+        let static_eval = Evaluation::evaluate(&position.board);
+        let futility_margin = match search_depth {
+            1 => 200, // ~2 pawns
+            2 => 400, // ~4 pawns
+            3 => 600, // ~6 pawns
+            _ => 0,   // No futility pruning at higher depths
+        };
+        let can_futility_prune = !in_check 
+            && search_depth <= 3 
+            && (static_eval + futility_margin) <= alpha
+            && alpha.abs() < 30000; // Don't prune near mate
+
         let mut best_move = Move::null();
         let mut best_score = alpha;
         let mut tt_flag = TTFlag::Upper;
         let mut searched_quiets: Vec<Move> = Vec::new();
+        let mut moves_searched: usize = 0;
 
         while let Some(mv) = move_picker.next_move() {
             // Track quiet moves for history updates
@@ -804,10 +893,51 @@ impl Search {
                 break;
             }
 
-            // Simple alpha-beta search
+            // Futility pruning: skip quiet moves that are unlikely to raise alpha
+            // Only prune after we have at least one move searched (to avoid returning no move)
+            if can_futility_prune && is_quiet && moves_searched > 0 {
+                continue;
+            }
+
             position.make_move_fast(mv);
-            let score = -self.alphabeta(position, search_depth - 1, -beta, -alpha, ply + 1).1;
+            
+            // Principal Variation Search (PVS) combined with Late Move Reductions (LMR)
+            // First move: full window search
+            // Later moves: null window search (with optional LMR reduction)
+            // Re-search with full window if null window search beats alpha
+            let score = if moves_searched == 0 {
+                // First move - search with full window
+                -self.alphabeta(position, search_depth - 1, -beta, -alpha, ply + 1).1
+            } else {
+                // Later moves - use PVS with null window
+                
+                // Apply LMR for quiet moves late in the ordering
+                let reduction = if moves_searched >= 4 
+                    && search_depth >= 3 
+                    && is_quiet 
+                    && !in_check 
+                {
+                    // Calculate reduction: R=1 for moves 4-7, R=2 for moves 8+
+                    if moves_searched >= 8 { 2 } else { 1 }
+                } else {
+                    0
+                };
+                
+                let reduced_depth = (search_depth - 1).saturating_sub(reduction);
+                
+                // Null window search (possibly with LMR reduction)
+                let mut score = -self.alphabeta(position, reduced_depth, -alpha - 1, -alpha, ply + 1).1;
+                
+                // If null window search beats alpha, re-search with full window at full depth
+                if score > alpha && score < beta {
+                    score = -self.alphabeta(position, search_depth - 1, -beta, -alpha, ply + 1).1;
+                }
+                
+                score
+            };
+            
             position.undo_move_fast();
+            moves_searched += 1;
 
             if score > best_score {
                 best_score = score;
@@ -916,8 +1046,13 @@ impl Default for Search {
 mod tests {
     use super::*;
 
+    fn init_magic() {
+        crate::magic::init_attack_table();
+    }
+
     #[test]
     fn test_search_start() {
+        init_magic();
         let position = Position::from_start();
         let mut search = Search::new();
         let (best_move, score) = search.search(&position, 3, None);

@@ -12,6 +12,9 @@ use std::thread;
 use std::time::Duration;
 
 fn main() {
+    // Initialize magic bitboard attack tables
+    chessy::init();
+
     let args: Vec<String> = std::env::args().collect();
 
     if args.len() > 1 {

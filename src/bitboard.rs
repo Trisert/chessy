@@ -444,7 +444,8 @@ mod tests {
         let bb = Bitboard::from_square(0);
         let s = bb.to_string();
 
+        // Square 0 (A1) is on rank 0, which is the last row printed
         assert!(s.contains("1"));
-        assert!(s.starts_with("1.......\n"));
+        assert!(s.ends_with("1.......\n"));
     }
 }

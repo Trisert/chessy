@@ -474,9 +474,9 @@ mod tests {
         let white_material = board.count_material(Color::White);
         let black_material = board.count_material(Color::Black);
 
-        // Starting position: 8*100 + 2*320 + 2*330 + 2*500 + 1*900 = 3900
-        assert_eq!(white_material, 3900);
-        assert_eq!(black_material, 3900);
+        // Starting position: 8*100 + 2*320 + 2*330 + 2*500 + 1*900 = 4000
+        assert_eq!(white_material, 4000);
+        assert_eq!(black_material, 4000);
     }
 
     #[test]
