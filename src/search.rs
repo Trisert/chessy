@@ -1,6 +1,6 @@
 use crate::evaluation::Evaluation;
 use crate::movegen::MoveGen;
-use crate::moveorder::{is_capture, HistoryTable, KillerTable, MovePicker};
+use crate::moveorder::{is_capture, CountermoveTable, HistoryTable, KillerTable, MovePicker};
 use crate::piece::Color;
 use crate::position::Position;
 use crate::r#move::Move;
@@ -29,6 +29,8 @@ pub struct Search {
     history: HistoryTable,
     /// Killer move table
     killers: KillerTable,
+    /// Countermove table for response moves
+    countermoves: CountermoveTable,
     /// Number of threads for parallel search
     threads: usize,
 }
@@ -45,6 +47,7 @@ impl Search {
             tt: RefCell::new(TranspositionTable::new(256)), // 256 MB TT
             history: HistoryTable::new(),
             killers: KillerTable::new(),
+            countermoves: CountermoveTable::new(),
             threads: rayon::current_num_threads(),
         }
     }
@@ -60,6 +63,7 @@ impl Search {
             tt: RefCell::new(TranspositionTable::new(256)),
             history: HistoryTable::new(),
             killers: KillerTable::new(),
+            countermoves: CountermoveTable::new(),
             threads: rayon::current_num_threads(),
         }
     }
@@ -75,6 +79,7 @@ impl Search {
             tt: RefCell::new(TranspositionTable::new(tt_size_mb)),
             history: HistoryTable::new(),
             killers: KillerTable::new(),
+            countermoves: CountermoveTable::new(),
             threads: rayon::current_num_threads(),
         }
     }
@@ -90,6 +95,7 @@ impl Search {
             tt: RefCell::new(TranspositionTable::new(tt_size_mb)),
             history: HistoryTable::new(),
             killers: KillerTable::new(),
+            countermoves: CountermoveTable::new(),
             threads: rayon::current_num_threads(),
         }
     }
@@ -117,8 +123,6 @@ impl Search {
     /// Calculate dynamic depth adjustment based on position complexity
     /// Returns a depth modifier (negative for simpler positions, positive for complex ones)
     pub fn calculate_depth_modifier(position: &Position) -> i32 {
-        
-
         let mut modifier = 0;
 
         // Get static evaluation
@@ -298,9 +302,10 @@ impl Search {
         // New search generation for TT
         self.tt.borrow_mut().new_generation();
 
-        // Clear history and killers for new search
+        // Clear history, killers, and countermoves for new search
         self.history.clear();
         self.killers.clear();
+        self.countermoves.clear();
 
         // Get legal moves first
         let legal_moves = MoveGen::generate_legal_moves_ep(
@@ -441,7 +446,7 @@ impl Search {
 
                 // Search this line - alphabeta checks time internally via should_stop()
                 let (_, score) =
-                    thread_search.alphabeta(&mut thread_pos, depth - 1, -32000, 32000, 1);
+                    thread_search.alphabeta(&mut thread_pos, depth - 1, -32000, 32000, 1, Some(mv));
                 let score = -score; // Negate for the other side's perspective
 
                 // Get the node count from this thread
@@ -456,7 +461,10 @@ impl Search {
         self.nodes.fetch_add(total_nodes, Ordering::Relaxed);
 
         // Find best result
-        results.into_iter().max_by_key(|(_, score, _)| *score).map(|(mv, score, _)| (mv, score))
+        results
+            .into_iter()
+            .max_by_key(|(_, score, _)| *score)
+            .map(|(mv, score, _)| (mv, score))
     }
 
     /// Internal search implementation
@@ -484,9 +492,10 @@ impl Search {
         // New search generation for TT
         self.tt.borrow_mut().new_generation();
 
-        // Clear history and killers for new search
+        // Clear history, killers, and countermoves for new search
         self.history.clear();
         self.killers.clear();
+        self.countermoves.clear();
 
         let mut best_move = Move::null();
         let mut best_score = 0;
@@ -522,7 +531,7 @@ impl Search {
         // Iterative deepening with aspiration windows
         let mut prev_score = 0i32;
         const INITIAL_WINDOW: i32 = 25; // Start with ±25 centipawns
-        
+
         for d in 1..=depth {
             if self.should_stop() {
                 break;
@@ -535,19 +544,19 @@ impl Search {
             } else {
                 (-32000, 32000)
             };
-            
+
             let mut search_position = position.clone();
             let mut mv;
             let mut score;
-            
+
             // Aspiration window loop - widen window on fail
             loop {
-                (mv, score) = self.alphabeta(&mut search_position, d, alpha, beta, 0);
-                
+                (mv, score) = self.alphabeta(&mut search_position, d, alpha, beta, 0, None);
+
                 if self.should_stop() {
                     break;
                 }
-                
+
                 // Check if score is within window
                 if score <= alpha {
                     // Fail-low: widen alpha (search again with wider window)
@@ -561,7 +570,7 @@ impl Search {
                     // Score is within window - we're done
                     break;
                 }
-                
+
                 // If window is now full, break to avoid infinite loop
                 if alpha <= -32000 && beta >= 32000 {
                     break;
@@ -645,7 +654,7 @@ impl Search {
         position: &mut Position,
         mut alpha: i32,
         beta: i32,
-        qs_depth: usize,  // Quiescent search depth (starts at 0, not global ply)
+        qs_depth: usize, // Quiescent search depth (starts at 0, not global ply)
     ) -> i32 {
         if self.should_stop() {
             return 0;
@@ -721,7 +730,7 @@ impl Search {
         alpha
     }
 
-    /// Alpha-beta search - SIMPLIFIED FOR DEBUGGING
+    /// Alpha-beta search with advanced move ordering and pruning
     fn alphabeta(
         &mut self,
         position: &mut Position,
@@ -729,6 +738,7 @@ impl Search {
         alpha: i32,
         beta: i32,
         ply: usize,
+        opponent_last_move: Option<Move>,
     ) -> (Move, i32) {
         // Use mutable alpha for the search (allows TT to improve alpha)
         let mut alpha = alpha;
@@ -760,7 +770,7 @@ impl Search {
         let tt_move = tt_entry.map(|e| e.best_move());
 
         // Validate TT move
-        let validated_tt_move = tt_move.and_then(|mv| {
+        let mut validated_tt_move = tt_move.and_then(|mv| {
             if Self::is_move_legal_optimized(position, mv) {
                 Some(mv)
             } else {
@@ -768,13 +778,34 @@ impl Search {
             }
         });
 
-        // Create move picker with history and killer tables
+        // Internal Iterative Deepening (IID) - DISABLED
+        // Temporarily disabled due to time management issues
+        // TODO: Re-enable with proper time budget checking
+        /*
+        const IID_MIN_DEPTH: u32 = 6;
+        const IID_REDUCTION: u32 = 3;
+
+        if validated_tt_move.is_none() && search_depth >= IID_MIN_DEPTH && !in_check {
+            // Do a shallow search to find a good move
+            let iid_depth = search_depth.saturating_sub(IID_REDUCTION);
+            let (iid_move, _) =
+                self.alphabeta(position, iid_depth, alpha, beta, ply, opponent_last_move);
+
+            if !iid_move.is_null() {
+                validated_tt_move = Some(iid_move);
+            }
+        }
+        */
+
+        // Create move picker with history, killer, and countermove tables
         let mut move_picker = MovePicker::new(
             position,
             validated_tt_move,
             ply,
             Some(&self.history),
             Some(&self.killers),
+            Some(&self.countermoves),
+            opponent_last_move,
         );
 
         // No legal moves
@@ -818,27 +849,33 @@ impl Search {
         // If they still can't beat beta, this position is likely very good for us
         const NULL_MOVE_REDUCTION: u32 = 3; // R = 3 is standard
         const NULL_MOVE_MIN_DEPTH: u32 = 3; // Don't do NMP at low depths
-        
+
         if !in_check && search_depth >= NULL_MOVE_MIN_DEPTH && beta < 30000 && beta > -30000 {
             // Additional safety: don't do null move in zugzwang-prone endgames
             // Simple heuristic: require at least one non-pawn piece
             let our_pieces = position.board.color_bb(color);
-            let our_pawns = position.board.piece_bb(crate::piece::PieceType::Pawn, color);
-            let our_king = position.board.piece_bb(crate::piece::PieceType::King, color);
-            let non_pawn_pieces = (our_pieces.as_u64() ^ our_pawns.as_u64() ^ our_king.as_u64()).count_ones();
-            
+            let our_pawns = position
+                .board
+                .piece_bb(crate::piece::PieceType::Pawn, color);
+            let our_king = position
+                .board
+                .piece_bb(crate::piece::PieceType::King, color);
+            let non_pawn_pieces =
+                (our_pieces.as_u64() ^ our_pawns.as_u64() ^ our_king.as_u64()).count_ones();
+
             if non_pawn_pieces > 0 {
                 // Make null move
                 let old_ep = position.make_null_move_fast();
-                
+
                 // Search with reduced depth
                 let null_depth = search_depth.saturating_sub(NULL_MOVE_REDUCTION + 1);
-                let (_, null_score) = self.alphabeta(position, null_depth, -beta, -beta + 1, ply + 1);
+                let (_, null_score) =
+                    self.alphabeta(position, null_depth, -beta, -beta + 1, ply + 1, None);
                 let null_score = -null_score;
-                
+
                 // Undo null move
                 position.undo_null_move_fast(old_ep);
-                
+
                 // If the null move search still beats beta, this position is likely good
                 if null_score >= beta {
                     // Don't return mate scores from null move
@@ -869,10 +906,22 @@ impl Search {
             3 => 600, // ~6 pawns
             _ => 0,   // No futility pruning at higher depths
         };
-        let can_futility_prune = !in_check 
-            && search_depth <= 3 
+        let can_futility_prune = !in_check
+            && search_depth <= 3
             && (static_eval + futility_margin) <= alpha
             && alpha.abs() < 30000; // Don't prune near mate
+
+        // Razoring: at low depths, if static eval is far below alpha,
+        // only search captures and promotions (skip quiet moves entirely)
+        // This is more aggressive than futility pruning
+        const RAZOR_MARGIN: i32 = 300; // ~3 pawns
+        let can_razor = !in_check
+            && search_depth <= 2
+            && (static_eval + RAZOR_MARGIN) <= alpha
+            && alpha.abs() < 30000
+            && !position.board.king_square(color).map_or(false, |sq| {
+                MoveGen::is_square_attacked(&position.board, sq, color.flip())
+            }); // Don't razor if we have threats
 
         let mut best_move = Move::null();
         let mut best_score = alpha;
@@ -882,9 +931,8 @@ impl Search {
 
         while let Some(mv) = move_picker.next_move() {
             // Track quiet moves for history updates
-            let is_quiet = !is_capture(&position.board, color, mv)
-                && !mv.is_promotion()
-                && !mv.is_castle();
+            let is_quiet =
+                !is_capture(&position.board, color, mv) && !mv.is_promotion() && !mv.is_castle();
             if is_quiet {
                 searched_quiets.push(mv);
             }
@@ -899,43 +947,84 @@ impl Search {
                 continue;
             }
 
+            // Razoring: skip all quiet moves if position looks hopeless
+            // More aggressive than futility - skips ALL quiets, not just late ones
+            if can_razor && is_quiet {
+                continue;
+            }
+
             position.make_move_fast(mv);
-            
+
             // Principal Variation Search (PVS) combined with Late Move Reductions (LMR)
             // First move: full window search
             // Later moves: null window search (with optional LMR reduction)
             // Re-search with full window if null window search beats alpha
-            let score = if moves_searched == 0 {
-                // First move - search with full window
-                -self.alphabeta(position, search_depth - 1, -beta, -alpha, ply + 1).1
-            } else {
-                // Later moves - use PVS with null window
-                
-                // Apply LMR for quiet moves late in the ordering
-                let reduction = if moves_searched >= 4 
-                    && search_depth >= 3 
-                    && is_quiet 
-                    && !in_check 
-                {
-                    // Calculate reduction: R=1 for moves 4-7, R=2 for moves 8+
-                    if moves_searched >= 8 { 2 } else { 1 }
+
+            // Get history score for LMR decisions
+            let history_score = if is_quiet {
+                if let Some(piece) = position.board.get_piece(mv.from()) {
+                    self.history.get(color, piece.piece_type, mv.to())
                 } else {
                     0
-                };
-                
-                let reduced_depth = (search_depth - 1).saturating_sub(reduction);
-                
-                // Null window search (possibly with LMR reduction)
-                let mut score = -self.alphabeta(position, reduced_depth, -alpha - 1, -alpha, ply + 1).1;
-                
-                // If null window search beats alpha, re-search with full window at full depth
-                if score > alpha && score < beta {
-                    score = -self.alphabeta(position, search_depth - 1, -beta, -alpha, ply + 1).1;
                 }
-                
+            } else {
+                0
+            };
+
+            let score = if moves_searched == 0 {
+                // First move - search with full window
+                // Pass our move as the opponent's last move for countermove heuristic
+                -self
+                    .alphabeta(position, search_depth - 1, -beta, -alpha, ply + 1, Some(mv))
+                    .1
+            } else {
+                // Later moves - use PVS with null window
+
+                // Improved LMR: only reduce moves with low history scores
+                // Good history moves are searched at full depth
+                let history_threshold = 500; // Arbitrary threshold for "good" history
+                let allow_lmr = is_quiet && history_score < history_threshold;
+
+                // Apply LMR for quiet moves late in the ordering
+                let reduction =
+                    if moves_searched >= 4 && search_depth >= 3 && allow_lmr && !in_check {
+                        // Calculate reduction: R=1 for moves 4-7, R=2 for moves 8+
+                        // Also consider history: worse history = more reduction
+                        let base_reduction = if moves_searched >= 8 { 2 } else { 1 };
+
+                        // Additional reduction for very poor history scores
+                        let history_penalty = if history_score < 0 { 1 } else { 0 };
+
+                        (base_reduction + history_penalty).min(search_depth - 2)
+                    } else {
+                        0
+                    };
+
+                let reduced_depth = (search_depth - 1).saturating_sub(reduction);
+
+                // Null window search (possibly with LMR reduction)
+                let mut score = -self
+                    .alphabeta(
+                        position,
+                        reduced_depth,
+                        -alpha - 1,
+                        -alpha,
+                        ply + 1,
+                        Some(mv),
+                    )
+                    .1;
+
+                // If null window search beats alpha, re-search with full window at full depth
+                // (unless we had full depth already - i.e., no reduction was applied)
+                if score > alpha && score < beta && reduced_depth < search_depth - 1 {
+                    score = -self
+                        .alphabeta(position, search_depth - 1, -beta, -alpha, ply + 1, Some(mv))
+                        .1;
+                }
+
                 score
             };
-            
+
             position.undo_move_fast();
             moves_searched += 1;
 
@@ -947,19 +1036,41 @@ impl Search {
                 if best_score >= beta {
                     tt_flag = TTFlag::Lower;
 
-                    // Update killer move for quiet moves
+                    // Update killer move and countermove for quiet moves
                     if is_quiet {
                         self.killers.update(ply, mv);
 
+                        // Update countermove table: remember this as a good response
+                        // to the opponent's last move
+                        if let Some(last_mv) = opponent_last_move {
+                            if let Some(opp_piece) = position.board.get_piece(last_mv.to()) {
+                                self.countermoves.update(
+                                    Some(last_mv),
+                                    Some(opp_piece.piece_type),
+                                    mv,
+                                );
+                            }
+                        }
+
                         // Update history: success for cutoff move, failure for other searched quiets
                         if let Some(piece) = position.board.get_piece(mv.from()) {
-                            self.history.update_success(color, piece.piece_type, mv.to(), search_depth);
+                            self.history.update_success(
+                                color,
+                                piece.piece_type,
+                                mv.to(),
+                                search_depth,
+                            );
 
                             // Penalize all other quiet moves that were searched before this cutoff
                             for &quiet_mv in &searched_quiets {
                                 if quiet_mv != mv {
                                     if let Some(p) = position.board.get_piece(quiet_mv.from()) {
-                                        self.history.update_failure(color, p.piece_type, quiet_mv.to(), search_depth);
+                                        self.history.update_failure(
+                                            color,
+                                            p.piece_type,
+                                            quiet_mv.to(),
+                                            search_depth,
+                                        );
                                     }
                                 }
                             }
@@ -972,9 +1083,13 @@ impl Search {
         }
 
         // Store in TT
-        self.tt
-            .borrow_mut()
-            .store(position.state.hash, best_move, best_score, search_depth as u8, tt_flag);
+        self.tt.borrow_mut().store(
+            position.state.hash,
+            best_move,
+            best_score,
+            search_depth as u8,
+            tt_flag,
+        );
 
         (best_move, best_score)
     }

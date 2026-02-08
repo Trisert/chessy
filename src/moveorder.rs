@@ -31,46 +31,275 @@ pub fn mvv_lva_score(victim: PieceType, attacker: PieceType) -> i32 {
     PIECE_VALUES[victim as usize] * 16 - PIECE_VALUES[attacker as usize]
 }
 
-/// Static Exchange Evaluation (SEE)
+/// Static Exchange Evaluation (SEE) - Full implementation with recapture simulation
 ///
 /// Determines if a capture is profitable by calculating the material gain/loss
-/// if both sides capture on the square.
+/// if both sides capture on the square, simulating all recaptures.
 /// Returns positive = winning capture, negative = losing capture
 ///
-/// Note: side_to_move parameter is unused but kept for future full SEE implementation
-/// that would simulate recaptures.
+/// This uses a swap algorithm that simulates the sequence of captures
+/// and determines the final material balance.
 pub fn see(board: &Board, mv: Move) -> i32 {
     let to = mv.to();
     let from = mv.from();
 
-    // Get the piece being captured (if any)
-    let mut gain = if let Some(captured) = board.get_piece(to) {
+    // Get the initial attacking piece
+    let attacker = match board.get_piece(from) {
+        Some(p) => p,
+        None => return 0,
+    };
+
+    // Handle en passant captures
+    let mut ep_capture_sq = None;
+    if mv.is_en_passant() {
+        ep_capture_sq = Some(if attacker.color == Color::White {
+            to - 8
+        } else {
+            to + 8
+        });
+    }
+
+    // Track pieces for swap algorithm
+    // We use bitboards to track which pieces can attack the square
+    let mut attackers = get_attackers(board, to);
+    let mut occupied = board.occupied();
+
+    // Remove the moving piece from occupied
+    occupied.clear(from);
+
+    // If en passant, also remove the captured pawn
+    if let Some(ep_sq) = ep_capture_sq {
+        occupied.clear(ep_sq);
+    }
+
+    // Array to store swap values
+    let mut swap_list: [i32; 32] = [0; 32];
+    let mut depth = 0;
+
+    // First capture value
+    swap_list[0] = if let Some(captured) = board.get_piece(to) {
         PIECE_VALUES[captured.piece_type as usize]
+    } else if mv.is_en_passant() {
+        PIECE_VALUES[PieceType::Pawn as usize]
     } else {
         0
     };
 
-    // Get the attacking piece
-    let attacker = match board.get_piece(from) {
-        Some(p) => p,
-        None => return gain, // Can't capture what's not there
-    };
-
-    let attacker_value = PIECE_VALUES[attacker.piece_type as usize];
-
-    // If this is not a capture (or en passant), just return 0
-    if gain == 0 && !mv.is_en_passant() {
-        return 0;
+    if swap_list[0] == 0 && !mv.is_en_passant() {
+        return 0; // Not a capture
     }
 
-    // For en passant, we capture a pawn
-    if mv.is_en_passant() {
-        gain = PIECE_VALUES[PieceType::Pawn as usize];
+    // Current side to move (after our capture)
+    let mut stm = attacker.color.flip();
+
+    // Simulate recaptures
+    loop {
+        // Find the least valuable attacker for the side to move
+        if let Some((attacker_sq, attacker_type)) =
+            find_least_valuable_attacker(board, &occupied, to, stm, &attackers)
+        {
+            depth += 1;
+
+            // Calculate gain/loss for this capture
+            swap_list[depth] = PIECE_VALUES[attacker_type as usize] - swap_list[depth - 1];
+
+            // Remove this attacker from occupied and attackers
+            occupied.clear(attacker_sq);
+            attackers.clear(attacker_sq);
+
+            // Add newly discovered attackers (behind the piece we just moved)
+            add_discovered_attackers(board, &occupied, to, &mut attackers);
+
+            // Switch side
+            stm = stm.flip();
+        } else {
+            break;
+        }
+
+        // Safety limit
+        if depth >= 31 {
+            break;
+        }
     }
 
-    // Simple SEE: just check if our piece is worth less than what we capture
-    // A full SEE would simulate all recaptures, but this simple version works well
-    gain - attacker_value
+    // Calculate final score by working backwards through the swap list
+    // At each step, the player will only continue if it's profitable
+    while depth > 0 {
+        depth -= 1;
+        swap_list[depth] = -swap_list[depth + 1].max(-swap_list[depth]);
+    }
+
+    swap_list[0]
+}
+
+/// Get all pieces attacking a square
+fn get_attackers(board: &Board, sq: u8) -> crate::bitboard::Bitboard {
+    let mut attackers = crate::bitboard::Bitboard::new(0);
+
+    // Check all pieces that could attack this square
+    for from_sq in 0..64 {
+        if let Some(piece) = board.get_piece(from_sq) {
+            // Use pseudo-legal attack check
+            if is_piece_attacking(board, piece, from_sq, sq) {
+                attackers.set(from_sq);
+            }
+        }
+    }
+
+    attackers
+}
+
+/// Check if a piece can attack a square (pseudo-legal)
+fn is_piece_attacking(board: &Board, piece: crate::piece::Piece, from: u8, to: u8) -> bool {
+    match piece.piece_type {
+        PieceType::Pawn => {
+            // Pawns attack diagonally
+            let dir = if piece.color == Color::White {
+                8i32
+            } else {
+                -8i32
+            };
+            let from_file = (from % 8) as i32;
+            let to_file = (to % 8) as i32;
+            let to_rank = (to / 8) as i32;
+            let from_rank = (from / 8) as i32;
+
+            // Check diagonal attack
+            let expected_rank = from_rank + (dir / 8);
+            if to_rank == expected_rank && (to_file - from_file).abs() == 1 {
+                return true;
+            }
+            false
+        }
+        PieceType::Knight => {
+            let df = (to_file(from) as i32 - to_file(to) as i32).abs();
+            let dr = (to_rank(from) as i32 - to_rank(to) as i32).abs();
+            df * dr == 2 && df + dr == 3
+        }
+        PieceType::Bishop => {
+            // Diagonal
+            let df = (to_file(from) as i32 - to_file(to) as i32).abs();
+            let dr = (to_rank(from) as i32 - to_rank(to) as i32).abs();
+            if df == dr && df > 0 {
+                return path_clear(board, from, to);
+            }
+            false
+        }
+        PieceType::Rook => {
+            // Straight
+            let df = (to_file(from) as i32 - to_file(to) as i32).abs();
+            let dr = (to_rank(from) as i32 - to_rank(to) as i32).abs();
+            if (df == 0 || dr == 0) && df + dr > 0 {
+                return path_clear(board, from, to);
+            }
+            false
+        }
+        PieceType::Queen => {
+            // Diagonal or straight
+            let df = (to_file(from) as i32 - to_file(to) as i32).abs();
+            let dr = (to_rank(from) as i32 - to_rank(to) as i32).abs();
+            if (df == dr || df == 0 || dr == 0) && df + dr > 0 {
+                return path_clear(board, from, to);
+            }
+            false
+        }
+        PieceType::King => {
+            let df = (to_file(from) as i32 - to_file(to) as i32).abs();
+            let dr = (to_rank(from) as i32 - to_rank(to) as i32).abs();
+            df <= 1 && dr <= 1 && df + dr > 0
+        }
+    }
+}
+
+#[inline]
+fn to_file(sq: u8) -> u8 {
+    sq % 8
+}
+
+#[inline]
+fn to_rank(sq: u8) -> u8 {
+    sq / 8
+}
+
+/// Check if path between two squares is clear (for sliding pieces)
+fn path_clear(board: &Board, from: u8, to: u8) -> bool {
+    let from_file = to_file(from) as i32;
+    let from_rank = to_rank(from) as i32;
+    let to_file = to_file(to) as i32;
+    let to_rank = to_rank(to) as i32;
+
+    let df = (to_file - from_file).signum();
+    let dr = (to_rank - from_rank).signum();
+
+    let mut f = from_file + df;
+    let mut r = from_rank + dr;
+
+    while (f, r) != (to_file, to_rank) {
+        let sq = (r * 8 + f) as u8;
+        if board.occupied().get(sq) {
+            return false;
+        }
+        f += df;
+        r += dr;
+    }
+
+    true
+}
+
+/// Find the least valuable attacker for a given side
+fn find_least_valuable_attacker(
+    board: &Board,
+    occupied: &crate::bitboard::Bitboard,
+    _target_sq: u8,
+    color: Color,
+    attackers: &crate::bitboard::Bitboard,
+) -> Option<(u8, PieceType)> {
+    // Try pieces in order of value (pawn first)
+    for piece_type in [
+        PieceType::Pawn,
+        PieceType::Knight,
+        PieceType::Bishop,
+        PieceType::Rook,
+        PieceType::Queen,
+        PieceType::King,
+    ] {
+        let piece_bb = board.piece_bb(piece_type, color);
+
+        // Find intersection of attackers, our pieces of this type, and occupied
+        for sq in 0..64 {
+            if attackers.get(sq) && piece_bb.get(sq) && occupied.get(sq) {
+                return Some((sq, piece_type));
+            }
+        }
+    }
+
+    None
+}
+
+/// Add any newly discovered attackers after a piece is removed
+fn add_discovered_attackers(
+    board: &Board,
+    occupied: &crate::bitboard::Bitboard,
+    target_sq: u8,
+    attackers: &mut crate::bitboard::Bitboard,
+) {
+    // Check sliding pieces that might now have line of sight
+    for sq in 0..64 {
+        if !occupied.get(sq) {
+            continue;
+        }
+
+        if let Some(piece) = board.get_piece(sq) {
+            if piece.piece_type == PieceType::Bishop
+                || piece.piece_type == PieceType::Rook
+                || piece.piece_type == PieceType::Queen
+            {
+                if is_piece_attacking(board, piece, sq, target_sq) && !attackers.get(sq) {
+                    attackers.set(sq);
+                }
+            }
+        }
+    }
 }
 
 /// Check if a capture is "winning" (positive SEE)
@@ -160,12 +389,14 @@ pub fn score_move(
         let see_score = see(board, mv);
         if see_score >= 0 {
             // Winning capture: score higher than killers
-            return 900_000 + mvv_lva_score(
-                captured_piece_type(board, side_to_move, mv).unwrap_or(PieceType::Pawn),
-                board.get_piece(mv.from())
-                    .map(|p| p.piece_type)
-                    .unwrap_or(PieceType::Pawn),
-            );
+            return 900_000
+                + mvv_lva_score(
+                    captured_piece_type(board, side_to_move, mv).unwrap_or(PieceType::Pawn),
+                    board
+                        .get_piece(mv.from())
+                        .map(|p| p.piece_type)
+                        .unwrap_or(PieceType::Pawn),
+                );
         } else {
             // Losing capture: negative score
             return -100_000 + see_score;
@@ -340,6 +571,64 @@ impl Default for KillerTable {
     }
 }
 
+/// Countermove Heuristic table
+///
+/// Stores the best response move for each (piece, to_square) combination.
+/// When the opponent moves a piece to a square, we look up what move
+/// worked well in response previously and prioritize it.
+///
+/// Format: countermoves[opponent_piece][to_square] = our_best_response_move
+pub struct CountermoveTable {
+    countermoves: [[[Option<Move>; 64]; 6]; 2], // [color][piece_type][to_square]
+}
+
+impl CountermoveTable {
+    pub fn new() -> Self {
+        CountermoveTable {
+            countermoves: [[[None; 64]; 6]; 2],
+        }
+    }
+
+    /// Update the countermove table after a beta cutoff
+    ///
+    /// We store our successful move as a response to the opponent's previous move.
+    /// If the opponent just played piece P to square S, and our move M caused a cutoff,
+    /// we remember that M is a good response to (P, S).
+    pub fn update(
+        &mut self,
+        opponent_move: Option<Move>,
+        opponent_piece: Option<PieceType>,
+        our_move: Move,
+    ) {
+        if let (Some(opp_mv), Some(opp_piece)) = (opponent_move, opponent_piece) {
+            let color_idx = 0; // We store responses for the side to move (simplified)
+            let piece_idx = opp_piece.index();
+            let sq_idx = opp_mv.to() as usize;
+            self.countermoves[color_idx][piece_idx][sq_idx] = Some(our_move);
+        }
+    }
+
+    /// Get the countermove for a given opponent move
+    #[inline]
+    pub fn get(&self, opponent_piece: PieceType, to_sq: u8) -> Option<Move> {
+        let color_idx = 0;
+        let piece_idx = opponent_piece.index();
+        let sq_idx = to_sq as usize;
+        self.countermoves[color_idx][piece_idx][sq_idx]
+    }
+
+    /// Clear the countermove table
+    pub fn clear(&mut self) {
+        self.countermoves = [[[None; 64]; 6]; 2];
+    }
+}
+
+impl Default for CountermoveTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Move picker for ordered move generation
 ///
 /// Returns moves in the following order:
@@ -366,6 +655,8 @@ impl MovePicker {
         ply: usize,
         history: Option<&HistoryTable>,
         killers: Option<&KillerTable>,
+        countermoves: Option<&CountermoveTable>,
+        last_move: Option<Move>,
     ) -> Self {
         let moves = MoveGen::generate_legal_moves_ep(
             &position.board,
@@ -374,10 +665,11 @@ impl MovePicker {
             position.state.castling_rights,
         );
 
-        // Pre-compute killer and history scores to avoid lifetime issues
+        // Pre-compute killer, history, and countermove scores to avoid lifetime issues
         let num_moves = moves.len();
         let mut history_scores = vec![0; num_moves];
         let mut killer_scores = vec![0; num_moves];
+        let mut countermove_scores = vec![0; num_moves];
 
         if let Some(killers) = killers {
             let killer_moves = killers.get(ply);
@@ -394,7 +686,26 @@ impl MovePicker {
             for i in 0..num_moves {
                 let mv = moves.get(i);
                 if let Some(piece) = position.board.get_piece(mv.from()) {
-                    history_scores[i] = hist.get_normalized(side_to_move, piece.piece_type, mv.to());
+                    history_scores[i] =
+                        hist.get_normalized(side_to_move, piece.piece_type, mv.to());
+                }
+            }
+        }
+
+        // Check for countermoves
+        if let Some(cm_table) = countermoves {
+            if let Some(last_mv) = last_move {
+                // Get the piece that moved to this square
+                if let Some(captured_piece) = position.board.get_piece(last_mv.to()) {
+                    if let Some(counter_mv) = cm_table.get(captured_piece.piece_type, last_mv.to())
+                    {
+                        for i in 0..num_moves {
+                            if moves.get(i) == counter_mv {
+                                countermove_scores[i] = 1;
+                                break;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -408,7 +719,7 @@ impl MovePicker {
             history_scores,
             killer_scores,
         };
-        picker.score_moves(&position.board, side_to_move);
+        picker.score_moves(&position.board, side_to_move, &countermove_scores);
         picker
     }
 
@@ -452,12 +763,12 @@ impl MovePicker {
             history_scores: vec![0; num_moves],
             killer_scores: vec![0; num_moves],
         };
-        picker.score_moves(&position.board, side_to_move);
+        picker.score_moves(&position.board, side_to_move, &[]);
         picker
     }
 
     /// Score all moves for ordering
-    fn score_moves(&mut self, board: &Board, side_to_move: Color) {
+    fn score_moves(&mut self, board: &Board, side_to_move: Color, countermove_scores: &[i32]) {
         for i in 0..self.moves.len() {
             let mv = self.moves.get(i);
 
@@ -500,15 +811,23 @@ impl MovePicker {
                 if score == 0 && is_cap {
                     let see_score = see(board, mv);
                     if see_score >= 0 {
-                        score = 400_000 + mvv_lva_score(
-                            captured_piece_type(board, side_to_move, mv).unwrap_or(PieceType::Pawn),
-                            board.get_piece(mv.from())
-                                .map(|p| p.piece_type)
-                                .unwrap_or(PieceType::Pawn),
-                        );
+                        score = 400_000
+                            + mvv_lva_score(
+                                captured_piece_type(board, side_to_move, mv)
+                                    .unwrap_or(PieceType::Pawn),
+                                board
+                                    .get_piece(mv.from())
+                                    .map(|p| p.piece_type)
+                                    .unwrap_or(PieceType::Pawn),
+                            );
                     } else {
                         score = -100_000 + see_score;
                     }
+                }
+
+                // Countermove bonus (very high priority - above killers)
+                if score == 0 && !countermove_scores.is_empty() && countermove_scores[i] > 0 {
+                    score = 550_000;
                 }
 
                 // Killer bonus
@@ -520,7 +839,7 @@ impl MovePicker {
                 if score == 0 && self.history_scores[i] > 0 {
                     score = self.history_scores[i];
                 }
-                
+
                 // PST-based move ordering for quiet moves without history
                 // This prioritizes central pawn moves (d4, e4) over edge moves (a3, b3)
                 if score == 0 {
@@ -530,30 +849,44 @@ impl MovePicker {
                         // PST bonus based on destination square
                         let to_rank = (to / 8) as i32;
                         let to_file = (to % 8) as i32;
-                        
+
                         // Center control bonus (d4, e4, d5, e5 are best)
                         let center_dist = ((to_file - 3).abs() + (to_file - 4).abs()).min(1)
-                                        + ((to_rank - 3).abs() + (to_rank - 4).abs()).min(1);
+                            + ((to_rank - 3).abs() + (to_rank - 4).abs()).min(1);
                         let center_bonus = (4 - center_dist) * 100; // Up to 400
-                        
+
                         // Pawn advancement bonus
                         let pawn_bonus = if piece.piece_type == PieceType::Pawn {
                             // Flip rank for black pawns
-                            let rank = if side_to_move == Color::White { to_rank } else { 7 - to_rank };
+                            let rank = if side_to_move == Color::White {
+                                to_rank
+                            } else {
+                                7 - to_rank
+                            };
                             rank * 50 // Encourage pawn advancement
                         } else {
                             0
                         };
-                        
+
                         // Development bonus for knights/bishops moving off back rank
-                        let dev_bonus = if piece.piece_type == PieceType::Knight || piece.piece_type == PieceType::Bishop {
+                        let dev_bonus = if piece.piece_type == PieceType::Knight
+                            || piece.piece_type == PieceType::Bishop
+                        {
                             let from_rank = (from / 8) as i32;
-                            let from_rank_adj = if side_to_move == Color::White { from_rank } else { 7 - from_rank };
-                            if from_rank_adj == 0 { 200 } else { 0 } // Bonus for leaving back rank
+                            let from_rank_adj = if side_to_move == Color::White {
+                                from_rank
+                            } else {
+                                7 - from_rank
+                            };
+                            if from_rank_adj == 0 {
+                                200
+                            } else {
+                                0
+                            } // Bonus for leaving back rank
                         } else {
                             0
                         };
-                        
+
                         score = center_bonus + pawn_bonus + dev_bonus;
                     }
                 }
