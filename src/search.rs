@@ -1027,14 +1027,7 @@ impl Search {
                 continue;
             }
 
-            position.make_move_fast(mv);
-
-            // Principal Variation Search (PVS) combined with Late Move Reductions (LMR)
-            // First move: full window search
-            // Later moves: null window search (with optional LMR reduction)
-            // Re-search with full window if null window search beats alpha
-
-            // Get history score for LMR decisions
+            // Get history score for LMR and LMP decisions
             let history_score = if is_quiet {
                 if let Some(piece) = position.board.get_piece(mv.from()) {
                     self.history.get(color, piece.piece_type, mv.to())
@@ -1044,6 +1037,27 @@ impl Search {
             } else {
                 0
             };
+
+            // LATE MOVE PRUNING (LMP) - skip very late quiet moves
+            // If we've searched many moves and alpha hasn't improved, prune the rest
+            const LMP_MIN_MOVES: usize = 20; // Only consider after 20 moves
+            const LMP_THRESHOLD: i32 = 100; // Only if history is very bad
+
+            if is_quiet
+                && moves_searched >= LMP_MIN_MOVES
+                && moves_searched >= 4 * moves_searched.saturating_sub(4)
+                && history_score < LMP_THRESHOLD
+                && best_score <= alpha + 50
+            {
+                continue;
+            }
+
+            position.make_move_fast(mv);
+
+            // Principal Variation Search (PVS) combined with Late Move Reductions (LMR)
+            // First move: full window search
+            // Later moves: null window search (with optional LMR reduction)
+            // Re-search with full window if null window search beats alpha
 
             let score = if moves_searched == 0 {
                 // First move - search with full window
