@@ -1,7 +1,7 @@
 use crate::evaluation::Evaluation;
 use crate::movegen::MoveGen;
-use crate::moveorder::{is_capture, CountermoveTable, HistoryTable, KillerTable, MovePicker};
-use crate::piece::Color;
+use crate::moveorder::{is_capture, see, CountermoveTable, HistoryTable, KillerTable, MovePicker};
+use crate::piece::{Color, PieceType};
 use crate::position::Position;
 use crate::r#move::Move;
 use crate::transposition::{TTFlag, TranspositionTable};
@@ -720,7 +720,7 @@ impl Search {
         let mut move_picker = MovePicker::new_quiescent(position);
 
         while let Some(mv) = move_picker.next_move() {
-            // Delta pruning: if capture can't improve alpha enough, skip it
+            // IMPROVED Delta pruning: if capture can't improve alpha enough, skip it
             // (unless it's a promotion which can be worth much more)
             if !mv.is_promotion() {
                 let captured_value = match position.board.get_piece(mv.to()) {
@@ -735,9 +735,28 @@ impl Search {
                     None => 0,
                 };
 
-                // If even with the captured piece we can't exceed alpha by a queen, skip
-                if eval + captured_value + 900 < alpha {
+                // Improved delta pruning: use variable margin based on depth
+                // Deeper in QS = more aggressive pruning
+                let delta_margin = match qs_depth {
+                    0 => 900, // At start of QS, only skip captures below queen value
+                    1 => 700, // Deeper = can skip captures below rook value
+                    2 => 500, // Skip captures below bishop value
+                    3 => 330, // Skip captures below knight value
+                    _ => 200, // Deep in QS = skip most captures
+                };
+
+                if eval + captured_value + delta_margin < alpha {
                     continue;
+                }
+
+                // SEE-based pruning: skip captures that lose material
+                // Use the fast SEE approximation from moveorder
+                let see_score = see(&position.board, mv);
+                if see_score < 0 {
+                    // This capture loses material - only try if we're desperate
+                    if eval + captured_value + 200 < alpha {
+                        continue;
+                    }
                 }
             }
 
@@ -966,6 +985,68 @@ impl Search {
 
                         // If verification fails, continue with normal search
                         // Store that this position was null-move tricky for future reference
+                    }
+                }
+            }
+        }
+
+        // ProbCut - Probabilistic Cutoff
+        // If static evaluation is much higher than beta, try a reduced-depth search
+        // If that reduced search still beats beta, we can prune with high confidence
+        const PROBCUT_MARGIN: i32 = 200; // Need eval to be at least 200cp above beta
+        const PROBCUT_DEPTH: u32 = 3; // Search depth for probcut
+
+        if !in_check && search_depth >= 5 && beta < 30000 && beta > -30000 {
+            let static_eval = Evaluation::evaluate(&position.board);
+            let eval = if color == Color::White {
+                static_eval
+            } else {
+                -static_eval
+            };
+
+            // If static eval is significantly above beta, try ProbCut
+            if eval >= beta + PROBCUT_MARGIN {
+                let probcut_beta = beta + 50; // Narrow window
+                let probcut_depth = (search_depth - 2).max(1);
+
+                // We need to generate a few moves to try
+                let probcut_moves = MoveGen::generate_moves(&position.board, color);
+
+                // Try the first few moves (we don't need many for ProbCut)
+                let moves_to_try = probcut_moves.len().min(8);
+
+                for i in 0..moves_to_try {
+                    let mv = probcut_moves.get(i);
+
+                    // Only try captures and major moves for ProbCut
+                    if let Some(piece) = position.board.get_piece(mv.from()) {
+                        if piece.piece_type == PieceType::Pawn
+                            || piece.piece_type == PieceType::King
+                        {
+                            continue; // Skip pawns and king
+                        }
+                    }
+
+                    // Make move
+                    position.make_move_fast(mv);
+
+                    // Search at reduced depth
+                    let (_, prob_score) = self.alphabeta(
+                        position,
+                        probcut_depth,
+                        -probcut_beta,
+                        -beta + 50,
+                        ply + 1,
+                        Some(mv),
+                    );
+                    let prob_score = -prob_score;
+
+                    // Undo move
+                    position.undo_move_fast();
+
+                    // If even reduced search beats beta, we can prune
+                    if prob_score >= beta {
+                        return (Move::null(), beta);
                     }
                 }
             }
