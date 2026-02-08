@@ -844,6 +844,34 @@ impl Search {
             }
         }
 
+        // Reverse Futility Pruning (RFP) / Beta Pruning
+        // If static evaluation is far above beta, even giving opponent a free move
+        // (worst case) won't drop the score below beta. So we can prune this node.
+        // Only applies when not in check and at low depths to avoid missing tactics.
+        if !in_check && search_depth <= 6 {
+            let static_eval = Evaluation::evaluate(&position.board);
+            let eval = if color == Color::White {
+                static_eval
+            } else {
+                -static_eval
+            };
+
+            // RFP margin increases with depth (tighter bounds at deeper depths)
+            let margin = match search_depth {
+                1 => 300,  // ~3 pawns at depth 1
+                2 => 500,  // ~5 pawns at depth 2
+                3 => 700,  // ~7 pawns at depth 3
+                4 => 900,  // ~9 pawns at depth 4
+                5 => 1100, // ~11 pawns at depth 5
+                _ => 1300, // ~13 pawns at depth 6+
+            };
+
+            // If we're doing well enough that even worst case won't fail high
+            if eval - margin >= beta && eval.abs() < 30000 {
+                return (Move::null(), beta);
+            }
+        }
+
         // Null Move Pruning
         // If we're not in check and have enough depth, try giving the opponent a free move
         // If they still can't beat beta, this position is likely very good for us
@@ -897,18 +925,26 @@ impl Search {
             return (Move::null(), score);
         }
 
-        // Futility pruning setup
-        // At low depths, if static eval is far below alpha, quiet moves are unlikely to help
+        // Extended Futility Pruning for frontier and pre-frontier nodes
+        // At depths 1-3, if static eval + margin < alpha, quiet moves unlikely to help
         let static_eval = Evaluation::evaluate(&position.board);
-        let futility_margin = match search_depth {
-            1 => 200, // ~2 pawns
-            2 => 400, // ~4 pawns
-            3 => 600, // ~6 pawns
-            _ => 0,   // No futility pruning at higher depths
+        let eval = if color == Color::White {
+            static_eval
+        } else {
+            -static_eval
         };
+
+        // Extended futility margins (more aggressive than basic futility)
+        let futility_margin = match search_depth {
+            1 => 200, // Frontier nodes: ~2 pawns
+            2 => 400, // Pre-frontier: ~4 pawns
+            3 => 600, // Depth 3: ~6 pawns
+            _ => 0,   // No futility at deeper depths
+        };
+
         let can_futility_prune = !in_check
             && search_depth <= 3
-            && (static_eval + futility_margin) <= alpha
+            && (eval + futility_margin) <= alpha
             && alpha.abs() < 30000; // Don't prune near mate
 
         // Razoring: at low depths, if static eval is far below alpha,
@@ -917,7 +953,7 @@ impl Search {
         const RAZOR_MARGIN: i32 = 300; // ~3 pawns
         let can_razor = !in_check
             && search_depth <= 2
-            && (static_eval + RAZOR_MARGIN) <= alpha
+            && (eval + RAZOR_MARGIN) <= alpha
             && alpha.abs() < 30000
             && !position.board.king_square(color).map_or(false, |sq| {
                 MoveGen::is_square_attacked(&position.board, sq, color.flip())
