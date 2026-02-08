@@ -823,7 +823,7 @@ impl Search {
         let tt_move = tt_entry.map(|e| e.best_move());
 
         // Validate TT move
-        let mut validated_tt_move = tt_move.and_then(|mv| {
+        let validated_tt_move = tt_move.and_then(|mv| {
             if Self::is_move_legal_optimized(position, mv) {
                 Some(mv)
             } else {
@@ -994,7 +994,6 @@ impl Search {
         // If static evaluation is much higher than beta, try a reduced-depth search
         // If that reduced search still beats beta, we can prune with high confidence
         const PROBCUT_MARGIN: i32 = 200; // Need eval to be at least 200cp above beta
-        const PROBCUT_DEPTH: u32 = 3; // Search depth for probcut
 
         if !in_check && search_depth >= 5 && beta < 30000 && beta > -30000 {
             let static_eval = Evaluation::evaluate(&position.board);

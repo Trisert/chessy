@@ -210,7 +210,6 @@ impl Evaluation {
         // Mobility matters but not as much as pawn structure
         let white_activity = Self::piece_activity(board, Color::White);
         let black_activity = Self::piece_activity(board, Color::Black);
-        let activity_diff = (white_activity - black_activity).abs();
         score += (white_activity - black_activity) * 3 / 4; // 0.75x weight
 
         // King safety - INCREASED WEIGHT
