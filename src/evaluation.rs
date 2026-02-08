@@ -187,7 +187,13 @@ impl Evaluation {
         // Material evaluation (SIMD-optimized)
         let white_material = simd_material_count(board, Color::White);
         let black_material = simd_material_count(board, Color::Black);
+
+        // Early exit: if massive material difference, just return material
+        let material_diff = (white_material - black_material).abs();
         score += white_material - black_material;
+        if material_diff > 2000 {
+            return score; // King vs king+queen is obvious
+        }
 
         // Piece-square evaluation
         let white_pst = Self::piece_square_tables(board, Color::White);
@@ -204,13 +210,22 @@ impl Evaluation {
         // Mobility matters but not as much as pawn structure
         let white_activity = Self::piece_activity(board, Color::White);
         let black_activity = Self::piece_activity(board, Color::Black);
+        let activity_diff = (white_activity - black_activity).abs();
         score += (white_activity - black_activity) * 3 / 4; // 0.75x weight
 
         // King safety - INCREASED WEIGHT
         // King safety is critical in middlegame
         let white_king = Self::king_safety(board, Color::White);
         let black_king = Self::king_safety(board, Color::Black);
+        let king_safety_diff = (white_king - black_king).abs();
         score += (white_king - black_king) * 3 / 2; // 1.5x weight
+
+        // Early exit: if king safety is extreme, skip detailed remaining evaluation
+        if king_safety_diff > 500 {
+            // Add tempo and return
+            score += 20;
+            return score;
+        }
 
         // Threat detection - BALANCED WEIGHTS
         // Penalty for hanging pieces is more important than threatening
