@@ -530,7 +530,8 @@ impl Search {
 
         // Iterative deepening with aspiration windows
         let mut prev_score = 0i32;
-        const INITIAL_WINDOW: i32 = 25; // Start with ±25 centipawns
+        const INITIAL_WINDOW: i32 = 15; // Start with ±15 centipawns (tighter = faster)
+        const MAX_WINDOW: i32 = 100; // Cap the window expansion
 
         for d in 1..=depth {
             if self.should_stop() {
@@ -538,43 +539,69 @@ impl Search {
             }
 
             // Set up aspiration window based on previous score
-            // Use wider window for first few depths since score is unstable
+            // Use wider window for deeper depths since we have more confidence
+            let mut window_size = if d >= 6 {
+                INITIAL_WINDOW * 2 // Deeper = wider window
+            } else if d >= 4 {
+                INITIAL_WINDOW
+            } else {
+                INITIAL_WINDOW * 2 // Shallow = need wider window
+            };
+
             let (mut alpha, mut beta) = if d >= 4 && prev_score.abs() < 30000 {
-                (prev_score - INITIAL_WINDOW, prev_score + INITIAL_WINDOW)
+                (
+                    (prev_score - window_size).max(-32000),
+                    (prev_score + window_size).min(32000),
+                )
             } else {
                 (-32000, 32000)
             };
 
             let mut search_position = position.clone();
-            let mut mv;
-            let mut score;
+            let mut mv = Move::null();
+            let mut score = 0;
+            let mut failed = false;
 
             // Aspiration window loop - widen window on fail
-            loop {
+            for _attempt in 0..4 {
                 (mv, score) = self.alphabeta(&mut search_position, d, alpha, beta, 0, None);
 
                 if self.should_stop() {
+                    failed = true;
                     break;
                 }
 
                 // Check if score is within window
                 if score <= alpha {
                     // Fail-low: widen alpha (search again with wider window)
-                    alpha = (alpha - INITIAL_WINDOW * 2).max(-32000);
-                    search_position = position.clone(); // Reset position
+                    alpha = (alpha - window_size).max(-32000);
+                    search_position = position.clone();
+                    window_size *= 2; // Double window for next attempt
                 } else if score >= beta {
                     // Fail-high: widen beta
-                    beta = (beta + INITIAL_WINDOW * 2).min(32000);
-                    search_position = position.clone(); // Reset position
+                    beta = (beta + window_size).min(32000);
+                    search_position = position.clone();
+                    window_size *= 2; // Double window for next attempt
                 } else {
                     // Score is within window - we're done
+                    failed = false;
                     break;
                 }
 
-                // If window is now full, break to avoid infinite loop
-                if alpha <= -32000 && beta >= 32000 {
+                // Don't expand beyond MAX_WINDOW
+                if window_size > MAX_WINDOW {
+                    // Fall back to full window
+                    alpha = -32000;
+                    beta = 32000;
+                    search_position = position.clone();
+                    (mv, score) = self.alphabeta(&mut search_position, d, alpha, beta, 0, None);
+                    failed = false;
                     break;
                 }
+            }
+
+            if failed {
+                break;
             }
 
             // Check time after each depth iteration for bullet games
@@ -818,8 +845,11 @@ impl Search {
         // No legal moves
         if move_picker.is_empty() {
             if in_check {
-                return (Move::null(), -32000 + (search_depth as i32));
+                // CHECKMATE: return -MATE + distance to mate (more accurate)
+                const MATE_SCORE: i32 = 32000;
+                return (Move::null(), -MATE_SCORE + (search_depth as i32));
             } else {
+                // STALEMATE: return 0
                 return (Move::null(), 0);
             }
         }

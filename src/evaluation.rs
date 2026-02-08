@@ -246,9 +246,106 @@ impl Evaluation {
         let black_dev = Self::development(board, Color::Black);
         score += white_dev - black_dev;
 
+        // Endgame-specific evaluation
+        let endgame_score = Self::endgame(board, Color::White) - Self::endgame(board, Color::Black);
+        score += endgame_score;
+
+        // Draw contempt: slightly avoid draws when score is near zero
+        // This encourages active play when we're not winning or losing
+        const DRAW_CONTEMPT: i32 = 10; // Small penalty for zero score
+        if score.abs() < 30 {
+            // We're in a drawn-ish position
+            // Make 0 slightly worse to encourage fighting
+            score = if score == 0 { -DRAW_CONTEMPT } else { score };
+        }
+
         // Tempo bonus - INCREASED
         // Initiative is worth more than we thought
         score += 20; // Increased from 15
+
+        score
+    }
+
+    /// Endgame-specific evaluation
+    fn endgame(board: &Board, color: Color) -> i32 {
+        let mut score: i32 = 0;
+
+        // Count pieces to determine endgame phase
+        let white_pieces: i32 = board.piece_bb(PieceType::Queen, Color::White).count() as i32
+            + board.piece_bb(PieceType::Rook, Color::White).count() as i32 * 5
+            + board.piece_bb(PieceType::Bishop, Color::White).count() as i32 * 3
+            + board.piece_bb(PieceType::Knight, Color::White).count() as i32 * 3;
+
+        let black_pieces: i32 = board.piece_bb(PieceType::Queen, Color::Black).count() as i32
+            + board.piece_bb(PieceType::Rook, Color::Black).count() as i32 * 5
+            + board.piece_bb(PieceType::Bishop, Color::Black).count() as i32 * 3
+            + board.piece_bb(PieceType::Knight, Color::Black).count() as i32 * 3;
+
+        let total_minors = white_pieces + black_pieces;
+
+        // Only do detailed endgame evaluation when only kings + few pieces remain
+        if total_minors > 6 {
+            return 0i32; // Too many pieces for endgame evaluation
+        }
+
+        // Opposition bonus/penalty for king pawn endgames
+        let my_pawns = board.piece_bb(PieceType::Pawn, color);
+        if my_pawns.count() > 0 && total_minors <= 4 {
+            let opp = color.flip();
+            let opp_pawns = board.piece_bb(PieceType::Pawn, opp);
+
+            if my_pawns.count() > 0 && opp_pawns.count() == 0 {
+                // King + pawn(s) vs lone king - check if we can queen
+                let king_sq = match board.king_square(color) {
+                    Some(sq) => sq,
+                    None => return 0i32,
+                };
+                let opp_king_sq = match board.king_square(color.flip()) {
+                    Some(sq) => sq,
+                    None => return 0i32,
+                };
+
+                // Bonus for having opposition (even number of squares between kings)
+                let file_dist = ((king_sq % 8) as i32 - (opp_king_sq % 8) as i32).abs();
+                let rank_dist = ((king_sq / 8) as i32 - (opp_king_sq / 8) as i32).abs();
+                let total_dist = file_dist + rank_dist;
+
+                if total_dist % 2 == 0 && total_dist > 0 {
+                    score += 20; // Good opposition
+                } else {
+                    score -= 10; // Bad opposition
+                }
+
+                // Bonus for advanced pawns
+                for sq in my_pawns.squares() {
+                    let rank: i32 = (sq / 8) as i32;
+                    if color == Color::White && rank >= 4 {
+                        score += (rank - 3) * 15; // More advanced = better
+                    } else if color == Color::Black && rank <= 3 {
+                        score += (3 - rank) * 15;
+                    }
+                }
+            }
+        }
+
+        // Bonus for connected rooks in endgame
+        let rooks = board.piece_bb(PieceType::Rook, color);
+        let rooks_bb = rooks.as_u64();
+        if rooks.count() >= 2 {
+            // Check if rooks are on same file or rank
+            if rooks_bb != 0 {
+                let first_sq = rooks_bb.trailing_zeros() as u8;
+                let remaining = rooks_bb & !(1u64 << first_sq);
+                if remaining != 0 {
+                    let second_sq = remaining.trailing_zeros() as u8;
+                    let same_file = first_sq % 8 == second_sq % 8;
+                    let same_rank = first_sq / 8 == second_sq / 8;
+                    if same_file || same_rank {
+                        score += 20; // Connected rooks bonus
+                    }
+                }
+            }
+        }
 
         score
     }
