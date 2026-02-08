@@ -225,9 +225,13 @@ impl Evaluation {
         let black_dev = Self::development(board, Color::Black);
         score += white_dev - black_dev;
 
+        // Tempo bonus - small bonus for having the move (initiative)
+        // This encourages active play and avoids passive positions
+        score += 15;
+
         score
     }
-    
+
     /// Evaluate center control (d4, d5, e4, e5)
     fn center_control(board: &Board, color: Color) -> i32 {
         // Center squares d4(27), d5(35), e4(28), e5(36)
@@ -236,22 +240,22 @@ impl Evaluation {
                               (1u64 << 26) | (1u64 << 29) | // c4, f4
                               (1u64 << 34) | (1u64 << 37) | // c5, f5
                               (1u64 << 42) | (1u64 << 43) | (1u64 << 44) | (1u64 << 45); // c6-f6
-        
+
         let all_pieces = board.color_bb(color).as_u64();
         let pawns = board.piece_bb(PieceType::Pawn, color).as_u64();
-        
+
         // Bonus for pieces/pawns in center
         let center_pawns = (pawns & CENTER).count_ones() as i32 * 25;
         let center_pieces = ((all_pieces ^ pawns) & CENTER).count_ones() as i32 * 15;
         let extended_pieces = (all_pieces & EXTENDED).count_ones() as i32 * 5;
-        
+
         center_pawns + center_pieces + extended_pieces
     }
-    
+
     /// Penalty for undeveloped minor pieces
     fn development(board: &Board, color: Color) -> i32 {
         let mut penalty = 0;
-        
+
         // Starting squares for knights and bishops
         let (knight_start, bishop_start) = if color == Color::White {
             // b1=1, g1=6, c1=2, f1=5
@@ -260,15 +264,15 @@ impl Evaluation {
             // b8=57, g8=62, c8=58, f8=61
             (1u64 << 57 | 1u64 << 62, 1u64 << 58 | 1u64 << 61)
         };
-        
+
         let knights = board.piece_bb(PieceType::Knight, color).as_u64();
         let bishops = board.piece_bb(PieceType::Bishop, color).as_u64();
-        
+
         // Penalty for knights still on starting squares
         penalty -= ((knights & knight_start).count_ones() as i32) * 15;
-        // Penalty for bishops still on starting squares  
+        // Penalty for bishops still on starting squares
         penalty -= ((bishops & bishop_start).count_ones() as i32) * 12;
-        
+
         penalty
     }
 
@@ -306,7 +310,7 @@ impl Evaluation {
     /// Calculate piece-square table score for a color
     fn piece_square_tables(board: &Board, color: Color) -> i32 {
         let mut score = 0;
-        
+
         // Use color-aware PST evaluation (flip squares for Black)
         let pst_eval = if color == Color::White {
             pst_eval_white
@@ -351,10 +355,10 @@ impl Evaluation {
             while sq < 64 {
                 let rank = sq / 8;
                 let file = sq % 8;
-                
+
                 // Rank-based advancement bonus (stronger for central files)
                 let base = [0, 5, 10, 20, 35, 50, 70, 0][rank];
-                
+
                 // File-based center bonus (much stronger for d/e files)
                 let center_bonus = match file {
                     3 | 4 => 15, // d/e files - strongly preferred
@@ -362,7 +366,7 @@ impl Evaluation {
                     1 | 6 => -3, // b/g files - slightly discouraged
                     _ => -8,     // a/h files - discouraged
                 };
-                
+
                 // Extra bonus for the "golden squares" d4, e4 (for White)
                 let golden_bonus = if rank == 3 && (file == 3 || file == 4) {
                     25 // Strong bonus for d4/e4
@@ -371,7 +375,7 @@ impl Evaluation {
                 } else {
                     0
                 };
-                
+
                 pst[sq] = base + center_bonus + golden_bonus;
                 sq += 1;
             }
@@ -847,7 +851,8 @@ impl Evaluation {
                 }
 
                 // Check bishops/queens (diagonal)
-                let bishop_attacks = crate::movegen::MoveGen::bishop_attacks_on_the_fly(target_sq, occupied);
+                let bishop_attacks =
+                    crate::movegen::MoveGen::bishop_attacks_on_the_fly(target_sq, occupied);
                 let bishop_queen = board.piece_bb(PieceType::Bishop, by_color)
                     | board.piece_bb(PieceType::Queen, by_color);
                 if (bishop_attacks & bishop_queen).as_u64() != 0 {
@@ -855,9 +860,10 @@ impl Evaluation {
                 }
 
                 // Check rooks/queens (straight)
-                let rook_attacks = crate::movegen::MoveGen::rook_attacks_on_the_fly(target_sq, occupied);
-                let rook_queen =
-                    board.piece_bb(PieceType::Rook, by_color) | board.piece_bb(PieceType::Queen, by_color);
+                let rook_attacks =
+                    crate::movegen::MoveGen::rook_attacks_on_the_fly(target_sq, occupied);
+                let rook_queen = board.piece_bb(PieceType::Rook, by_color)
+                    | board.piece_bb(PieceType::Queen, by_color);
                 if (rook_attacks & rook_queen).as_u64() != 0 {
                     attackers += 1;
                 }
@@ -957,53 +963,50 @@ impl Evaluation {
 
         false
     }
-    
+
     /// Static Exchange Evaluation (SEE)
     /// Returns positive value if the capture sequence starting with this move is winning
     /// Used for move ordering and pruning bad captures
     pub fn see(board: &Board, mv: crate::r#move::Move) -> i32 {
-        
-        
-        
         let from = mv.from();
         let to = mv.to();
         let color = match board.get_piece(from) {
             Some(p) => p.color,
             None => return 0,
         };
-        
+
         // Get value of the captured piece
         let captured_value = match board.get_piece(to) {
             Some(p) => MATERIAL_VALUES[p.piece_type as usize],
             None => return 0, // Not a capture
         };
-        
+
         // Get value of the attacking piece
         let attacker_value = match board.get_piece(from) {
             Some(p) => MATERIAL_VALUES[p.piece_type as usize],
             None => return 0,
         };
-        
+
         // Simple SEE: gain = captured - (risk of losing attacker)
         // If our attacker is worth less than what we capture, it's good
         // Otherwise, check if the square is defended
-        
+
         // Check if the target square is attacked by opponent
         let opponent = color.flip();
         let is_defended = Self::is_square_attacked_by(board, to, opponent);
-        
+
         if !is_defended {
             // Free capture
             return captured_value;
         }
-        
+
         // Square is defended - estimate the exchange
         // Simple heuristic: gain = captured value - min(attacker value, captured value)
         // This assumes the opponent will recapture with their least valuable piece
         let potential_loss = std::cmp::min(attacker_value, captured_value);
         captured_value - potential_loss
     }
-    
+
     /// Get piece value for SEE
     #[inline]
     pub fn piece_value(piece_type: PieceType) -> i32 {
