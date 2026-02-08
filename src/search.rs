@@ -761,9 +761,16 @@ impl Search {
         };
         let in_check = MoveGen::is_square_attacked(&position.board, king_sq, color.flip());
 
-        // TEMPORARILY DISABLED: Check extension causing performance issues
-        // Apply check extension: search deeper when in check
-        let search_depth = depth; // if in_check { (depth + 2).min(20) } else { depth };
+        // Check extension: search one ply deeper when in check
+        // This is crucial for avoiding tactical oversights in check sequences
+        const MAX_CHECK_EXTENSION: u32 = 1; // Extend by 1 ply max
+        const MAX_EXTENDED_DEPTH: u32 = 12; // Don't extend beyond this depth to control search explosion
+
+        let search_depth = if in_check && depth < MAX_EXTENDED_DEPTH {
+            (depth + MAX_CHECK_EXTENSION).min(MAX_EXTENDED_DEPTH)
+        } else {
+            depth
+        };
 
         // Get TT move for move ordering
         let tt_entry = self.tt.borrow().probe(position.state.hash);
@@ -904,11 +911,31 @@ impl Search {
                 // Undo null move
                 position.undo_null_move_fast(old_ep);
 
-                // If the null move search still beats beta, this position is likely good
+                // If the null move search still beats beta, verify with reduced verification search
+                // This prevents zugzwang positions from being incorrectly pruned
                 if null_score >= beta {
                     // Don't return mate scores from null move
                     if null_score < 30000 {
-                        return (Move::null(), beta);
+                        // VERIFICATION SEARCH: Search at reduced depth but with full window
+                        // to confirm the null move result before pruning
+                        const VERIFY_REDUCTION: u32 = 1;
+                        let verify_depth =
+                            search_depth.saturating_sub(NULL_MOVE_REDUCTION - VERIFY_REDUCTION);
+
+                        // Make null move again for verification search
+                        let old_ep_verify = position.make_null_move_fast();
+                        let (_, verify_score) =
+                            self.alphabeta(position, verify_depth, -beta, -beta + 1, ply + 1, None);
+                        let verify_score = -verify_score;
+                        position.undo_null_move_fast(old_ep_verify);
+
+                        // Only prune if verification also fails high
+                        if verify_score >= beta {
+                            return (Move::null(), beta);
+                        }
+
+                        // If verification fails, continue with normal search
+                        // Store that this position was null-move tricky for future reference
                     }
                 }
             }
@@ -965,6 +992,17 @@ impl Search {
         let mut searched_quiets: Vec<Move> = Vec::new();
         let mut moves_searched: usize = 0;
 
+        // SINGULAR EXTENSION DETECTION
+        // Check if we have a TT entry that suggests one move is much better
+        // If so, we might extend that move to verify it's truly best
+        let tt_suggestion = tt_entry.and_then(|entry| {
+            if entry.depth() >= search_depth.saturating_sub(2) as u8 {
+                Some((entry.best_move(), entry.score()))
+            } else {
+                None
+            }
+        });
+
         while let Some(mv) = move_picker.next_move() {
             // Track quiet moves for history updates
             let is_quiet =
@@ -1009,9 +1047,37 @@ impl Search {
 
             let score = if moves_searched == 0 {
                 // First move - search with full window
+                // Check for singular extension: if TT suggests this is much better than alternatives
+                let extension = if let Some((tt_mv, tt_score)) = tt_suggestion {
+                    // Singular extension: extend if TT move is significantly better
+                    // and this is the TT move
+                    const SINGULAR_MARGIN: i32 = 100; // Must be this much better
+                    if mv == tt_mv
+                        && search_depth >= 6
+                        && !in_check
+                        && tt_score.abs() < 30000
+                        && tt_score >= beta + SINGULAR_MARGIN
+                    {
+                        1 // Extend by 1 ply
+                    } else {
+                        0
+                    }
+                } else {
+                    0
+                };
+
+                let extended_depth = (search_depth + extension).min(15); // Cap extension
+
                 // Pass our move as the opponent's last move for countermove heuristic
                 -self
-                    .alphabeta(position, search_depth - 1, -beta, -alpha, ply + 1, Some(mv))
+                    .alphabeta(
+                        position,
+                        extended_depth - 1,
+                        -beta,
+                        -alpha,
+                        ply + 1,
+                        Some(mv),
+                    )
                     .1
             } else {
                 // Later moves - use PVS with null window

@@ -194,40 +194,46 @@ impl Evaluation {
         let black_pst = Self::piece_square_tables(board, Color::Black);
         score += white_pst - black_pst;
 
-        // Pawn structure evaluation
+        // Pawn structure evaluation - INCREASED WEIGHT
+        // Pawn structure is the soul of chess - worth more than piece activity
         let white_pawns = Self::pawn_structure(board, Color::White);
         let black_pawns = Self::pawn_structure(board, Color::Black);
-        score += white_pawns - black_pawns;
+        score += (white_pawns - black_pawns) * 4 / 3; // 1.33x weight
 
-        // Piece activity
+        // Piece activity - SLIGHTLY REDUCED
+        // Mobility matters but not as much as pawn structure
         let white_activity = Self::piece_activity(board, Color::White);
         let black_activity = Self::piece_activity(board, Color::Black);
-        score += white_activity - black_activity;
+        score += (white_activity - black_activity) * 3 / 4; // 0.75x weight
 
-        // King safety
+        // King safety - INCREASED WEIGHT
+        // King safety is critical in middlegame
         let white_king = Self::king_safety(board, Color::White);
         let black_king = Self::king_safety(board, Color::Black);
-        score += white_king - black_king;
+        score += (white_king - black_king) * 3 / 2; // 1.5x weight
 
-        // Threat detection - penalty for pieces under attack
+        // Threat detection - BALANCED WEIGHTS
+        // Penalty for hanging pieces is more important than threatening
         let white_threats = Self::count_threats(board, Color::White);
         let black_threats = Self::count_threats(board, Color::Black);
-        score -= white_threats * 20; // Penalty for our threatened pieces
-        score += black_threats * 20; // Bonus for threatening opponent
+        score -= white_threats * 25; // Penalty for our threatened pieces (INCREASED)
+        score += black_threats * 15; // Bonus for threatening opponent (reduced)
 
-        // Center control - bonus for pawns/pieces controlling center squares
+        // Center control - INCREASED WEIGHT
+        // Center control is crucial in the opening and middlegame
         let white_center = Self::center_control(board, Color::White);
         let black_center = Self::center_control(board, Color::Black);
-        score += white_center - black_center;
+        score += (white_center - black_center) * 5 / 4; // 1.25x weight
 
-        // Development - penalty for unmoved minor pieces in opening
+        // Development - KEEP AS IS
+        // Development bonuses work well in opening
         let white_dev = Self::development(board, Color::White);
         let black_dev = Self::development(board, Color::Black);
         score += white_dev - black_dev;
 
-        // Tempo bonus - small bonus for having the move (initiative)
-        // This encourages active play and avoids passive positions
-        score += 15;
+        // Tempo bonus - INCREASED
+        // Initiative is worth more than we thought
+        score += 20; // Increased from 15
 
         score
     }
