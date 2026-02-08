@@ -1109,10 +1109,10 @@ impl Search {
             }
         }
 
-        // Check time limit - use 95% of allocated time to leave safety margin
+        // Check time limit - use 85% of allocated time for safety
+        // This gives us a 15% buffer to ensure we never forfeit on time
         if let Some(limit) = self.time_limit.get() {
-            // Use 95% of time limit to leave margin for move output
-            let effective_limit = limit.mul_f64(0.95);
+            let effective_limit = limit.mul_f64(0.85);
             let elapsed = self.start_time.get().elapsed();
             if elapsed >= effective_limit {
                 return true;

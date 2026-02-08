@@ -323,8 +323,10 @@ fn handle_go(
         // Apply the modifier, ensuring depth stays within reasonable bounds
         let new_depth = (depth as i32 + depth_modifier).max(1).min(15) as u32;
         if new_depth != depth {
-            println!("info string Dynamic depth adjustment: {} -> {} (modifier: {})",
-                     depth, new_depth, depth_modifier);
+            println!(
+                "info string Dynamic depth adjustment: {} -> {} (modifier: {})",
+                depth, new_depth, depth_modifier
+            );
             depth = new_depth;
         }
     }
@@ -721,15 +723,23 @@ fn calculate_time_budget(
     let mut allocated = my_time / time_fraction as u64;
     allocated = allocated.saturating_add(my_inc);
 
-    // For bullet, use extremely small minimum and proportional buffer
+    // Apply safety margins based on time control
     allocated = if is_bullet {
-        // For bullet: minimum 10ms, with proportional buffer (1/4 to 200ms max)
-        // Ensure we don't underflow when subtracting buffer
-        let buffer = (my_time / 4).min(200);
-        let capped = my_time.saturating_sub(buffer).max(10);
-        allocated.max(10).min(capped)
+        // Bullet: very aggressive - use only 60% of calculated time
+        // Leave 300ms buffer minimum
+        let buffer = (my_time / 3).min(300);
+        let capped = my_time.saturating_sub(buffer).max(50);
+        (allocated * 6 / 10).max(50).min(capped)
+    } else if is_blitz {
+        // Blitz: use 70% of calculated time, leave 200ms buffer
+        let buffer = (my_time / 5).min(400);
+        let capped = my_time.saturating_sub(buffer).max(100);
+        (allocated * 7 / 10).max(100).min(capped)
     } else {
-        allocated.max(100).min(my_time.saturating_sub(50))
+        // Classical: use 80% of calculated time, leave 500ms buffer
+        let buffer = (my_time / 10).min(1000);
+        let capped = my_time.saturating_sub(buffer).max(200);
+        (allocated * 8 / 10).max(200).min(capped)
     };
 
     Some(allocated)
@@ -815,21 +825,37 @@ fn run_perft(depth: u32) {
 }
 
 fn run_depth_profile(fen: Option<&str>) {
-    
-
     // Test positions to use if no FEN provided
     let test_positions = vec![
-        ("Start Position", "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"),
-        ("Italian Opening", "r1bqbnr1/pppp1ppp/2n5/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 3"),
-        ("Tactical Position", "r2q1rk1/ppp2ppp/2n1pn2/3p4/1bPP4/2NQPN2/PP3PPP/R3K2R w KQ - 3 11"),
-        ("Endgame - Material Imbalance", "8/8/4k3/8/8/4K3/4Q3/4R3 w - - 0 1"),
-        ("King Under Attack", "r1b1k2r/ppppqppp/2n2n2/4p3/2B1P3/3P1N2/PPP2PPP/RNBQ1K1R w kq - 5 6"),
+        (
+            "Start Position",
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+        ),
+        (
+            "Italian Opening",
+            "r1bqbnr1/pppp1ppp/2n5/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 3",
+        ),
+        (
+            "Tactical Position",
+            "r2q1rk1/ppp2ppp/2n1pn2/3p4/1bPP4/2NQPN2/PP3PPP/R3K2R w KQ - 3 11",
+        ),
+        (
+            "Endgame - Material Imbalance",
+            "8/8/4k3/8/8/4K3/4Q3/4R3 w - - 0 1",
+        ),
+        (
+            "King Under Attack",
+            "r1b1k2r/ppppqppp/2n2n2/4p3/2B1P3/3P1N2/PPP2PPP/RNBQ1K1R w kq - 5 6",
+        ),
     ];
 
     let positions_to_analyze: Vec<(String, &str)> = if let Some(fen_str) = fen {
         vec![("Custom Position".to_string(), fen_str)]
     } else {
-        test_positions.into_iter().map(|(n, f)| (n.to_string(), f)).collect()
+        test_positions
+            .into_iter()
+            .map(|(n, f)| (n.to_string(), f))
+            .collect()
     };
 
     for (name, fen) in positions_to_analyze {
@@ -868,7 +894,10 @@ fn analyze_depth_profile(position: &Position) {
             }
         }
     }
-    println!("  Piece count: White {} | Black {}", white_pieces, black_pieces);
+    println!(
+        "  Piece count: White {} | Black {}",
+        white_pieces, black_pieces
+    );
 
     // Calculate depth modifier using the same logic as the engine
     let modifier = chessy::search::Search::calculate_depth_modifier(position);
@@ -879,7 +908,8 @@ fn analyze_depth_profile(position: &Position) {
     // King safety
     let king_sq = position.board.king_square(color);
     if let Some(sq) = king_sq {
-        let king_attacked = chessy::movegen::MoveGen::is_square_attacked(&position.board, sq, color.flip());
+        let king_attacked =
+            chessy::movegen::MoveGen::is_square_attacked(&position.board, sq, color.flip());
         if king_attacked {
             println!("    ⚠️  King in check (+2)");
         } else {
