@@ -725,11 +725,11 @@ fn calculate_time_budget(
 
     // Apply safety margins based on time control
     allocated = if is_bullet {
-        // Bullet: very aggressive - use only 60% of calculated time
-        // Leave 300ms buffer minimum
-        let buffer = (my_time / 3).min(300);
+        // Bullet: EXTREMELY aggressive - use only 40% of calculated time
+        // Leave 500ms buffer minimum for 3s games
+        let buffer = (my_time / 2).min(500); // Leave at least half or 500ms
         let capped = my_time.saturating_sub(buffer).max(50);
-        (allocated * 6 / 10).max(50).min(capped)
+        (allocated * 4 / 10).max(50).min(capped)
     } else if is_blitz {
         // Blitz: use 70% of calculated time, leave 200ms buffer
         let buffer = (my_time / 5).min(400);
