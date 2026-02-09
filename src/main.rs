@@ -724,22 +724,23 @@ fn calculate_time_budget(
     allocated = allocated.saturating_add(my_inc);
 
     // Apply safety margins based on time control
+    // NOTE: Disabled aggressive capping for now - use full calculated time
+    // The old code was too conservative and caused the engine to play poorly
     allocated = if is_bullet {
-        // Bullet: EXTREMELY aggressive - use only 40% of calculated time
-        // Leave 500ms buffer minimum for 3s games
-        let buffer = (my_time / 2).min(500); // Leave at least half or 500ms
-        let capped = my_time.saturating_sub(buffer).max(50);
-        (allocated * 4 / 10).max(50).min(capped)
-    } else if is_blitz {
-        // Blitz: use 70% of calculated time, leave 200ms buffer
-        let buffer = (my_time / 5).min(400);
+        // Bullet: use 80% of calculated time (was 40%)
+        let buffer = (my_time / 10).min(200);
         let capped = my_time.saturating_sub(buffer).max(100);
-        (allocated * 7 / 10).max(100).min(capped)
-    } else {
-        // Classical: use 80% of calculated time, leave 500ms buffer
-        let buffer = (my_time / 10).min(1000);
+        (allocated * 8 / 10).max(100).min(capped)
+    } else if is_blitz {
+        // Blitz: use 90% of calculated time (was 70%)
+        let buffer = (my_time / 20).min(200);
         let capped = my_time.saturating_sub(buffer).max(200);
-        (allocated * 8 / 10).max(200).min(capped)
+        (allocated * 9 / 10).max(200).min(capped)
+    } else {
+        // Classical: use 95% of calculated time (was 80%)
+        let buffer = (my_time / 20).min(500);
+        let capped = my_time.saturating_sub(buffer).max(500);
+        (allocated * 95 / 100).max(500).min(capped)
     };
 
     Some(allocated)

@@ -206,6 +206,27 @@ impl Evaluation {
         let black_pawns = Self::pawn_structure(board, Color::Black);
         score += (white_pawns - black_pawns) * 4 / 3; // 1.33x weight
 
+        // CRITICAL: Special penalty for Grob opening (g6/g5/g4/g3 pawn moves)
+        // These moves are extremely dangerous and should be heavily penalized
+        // White: g3 (rank 2) or g4 (rank 3) moved from g2 (rank 1)
+        let white_grobs = (board.get_piece(6 + 8 * 2).is_some() || board.get_piece(6 + 8 * 3).is_some()) &&
+                          board.get_piece(6 + 8 * 1).is_none();
+        // Black: g6 (rank 5) or g5 (rank 4) moved from g7 (rank 6)
+        let black_grobs = (board.get_piece(6 + 8 * 5).is_some() || board.get_piece(6 + 8 * 4).is_some()) &&
+                          board.get_piece(6 + 8 * 6).is_none();
+
+        // ADDITIONAL: Penalty for early g-pawn development (g6 for Black, g3 for White)
+        // Even single pawn advances on g-file weaken king safety
+        let white_g3 = board.get_piece(6 + 8 * 2).is_some() && board.get_piece(6 + 8 * 1).is_none();
+        let black_g6 = board.get_piece(6 + 8 * 5).is_some() && board.get_piece(6 + 8 * 6).is_none();
+
+        if white_grobs {
+            score -= 300; // MASSIVE penalty for g3/g4 pawn moves - Grob opening prevention
+        }
+        if black_grobs {
+            score -= 300; // MASSIVE penalty for g6/g5 pawn moves - Grob opening prevention
+        }
+
         // Piece activity - SLIGHTLY REDUCED
         // Mobility matters but not as much as pawn structure
         let white_activity = Self::piece_activity(board, Color::White);
@@ -244,6 +265,13 @@ impl Evaluation {
         let white_dev = Self::development(board, Color::White);
         let black_dev = Self::development(board, Color::Black);
         score += white_dev - black_dev;
+
+        // CRITICAL: Castling and King Position Evaluation
+        // We need Position to access castling rights, so calculate this differently
+        // The castling rights evaluation will be handled by checking king position only
+        let white_castling = Self::king_position_safety(board, Color::White);
+        let black_castling = Self::king_position_safety(board, Color::Black);
+        score += white_castling - black_castling;
 
         // Endgame-specific evaluation
         let endgame_score = Self::endgame(board, Color::White) - Self::endgame(board, Color::Black);
@@ -393,6 +421,89 @@ impl Evaluation {
         penalty
     }
 
+    /// King position and safety evaluation - CRITICAL for opening safety
+    fn king_position_safety(board: &Board, color: Color) -> i32 {
+        let mut score = 0;
+
+        let king_sq = match board.king_square(color) {
+            Some(sq) => sq,
+            None => return -1000, // King captured
+        };
+
+        let king_file = king_sq % 8;
+        let king_rank = king_sq / 8;
+
+        // Determine game phase (opening vs middlegame vs endgame)
+        let total_material = board.count_material(Color::White) + board.count_material(Color::Black);
+        let is_opening = total_material > 25000; // Most pieces still on board
+        let is_middlegame = total_material > 12000;
+
+        // === KING POSITION EVALUATION ===
+        if is_opening || is_middlegame {
+            // Penalty for king being in center (files d/e) during opening/middlegame
+            // King is safest on wings in the opening
+            let is_king_in_center = king_file >= 3 && king_file <= 4;
+
+            if is_king_in_center {
+                // Massive penalty for king in center files during opening
+                score -= 80; // INCREASED from 60
+
+                // Extra penalty if king has moved from starting square (exposed)
+                let king_start_sq = if color == Color::White { 4 } else { 60 };
+                if king_sq != king_start_sq {
+                    score -= 50; // King has moved to center - very dangerous (INCREASED from 40)
+                }
+            }
+
+            // Bonus for king being safely on wings (not in center)
+            let is_king_on_wing = !is_king_in_center;
+            if is_king_on_wing {
+                score += 25; // King is safely on wing (INCREASED from 20)
+            }
+
+            // Penalty for king being on wrong rank in opening
+            // White king should stay on rank 0-1, Black on rank 6-7
+            let proper_rank = if color == Color::White {
+                king_rank <= 1
+            } else {
+                king_rank >= 6
+            };
+            if !proper_rank && is_king_in_center {
+                score -= 40; // King advanced in center - very dangerous (INCREASED from 30)
+            }
+
+            // Check if king has moved from starting square but not castled
+            // This suggests lost castling rights without gaining safety
+            let king_start_sq = if color == Color::White { 4 } else { 60 };
+            if king_sq != king_start_sq && is_king_in_center {
+                score -= 30; // Moved king but still in center - dangerous position
+            }
+        }
+
+        // === WEAK PAWN MOVES THAT EXPOSE KING ===
+        // HUGE penalty for moving g-pawn that exposes king (Grob opening prevention)
+        let g_pawn_advanced = if color == Color::White {
+            // Check if g2 or g3 has a pawn (moved from g2)
+            !board.get_piece(6 + 8 * 1).is_some()
+        } else {
+            // Check if g7 or g6 has a pawn (moved from g7)
+            !board.get_piece(6 + 8 * 6).is_some()
+        };
+
+        if g_pawn_advanced {
+            // Massive penalty for g-pawn advance in opening/middlegame
+            score -= 100; // HUGE penalty - weakens king safety drastically
+
+            // Additional penalty if king is exposed on g-file or adjacent
+            let king_exposed = (king_file >= 5 && king_file <= 6);
+            if king_exposed {
+                score -= 80; // King is directly exposed by g-pawn advance
+            }
+        }
+
+        score
+    }
+
     /// Evaluate a position considering repetition history
     pub fn evaluate_with_history(position: &Position) -> i32 {
         let mut score = Self::evaluate(&position.board);
@@ -424,7 +535,32 @@ impl Evaluation {
         simd_material_count(board, color)
     }
 
-    /// Calculate piece-square table score for a color
+    /// Calculate game phase (0 = endgame, 256 = midgame)
+    /// Based on piece material excluding pawns
+    #[inline]
+    fn calculate_phase(board: &Board) -> i32 {
+        // Phase weights: Knight=1, Bishop=1, Rook=2, Queen=4
+        const TOTAL_PHASE: i32 = 24; // 4 knights + 4 bishops + 4 rooks + 2 queens = 4+4+8+8=24
+        
+        let mut phase = TOTAL_PHASE;
+        
+        // Subtract phase for each piece removed
+        let knights = board.piece_bb(PieceType::Knight, Color::White).count() as i32
+            + board.piece_bb(PieceType::Knight, Color::Black).count() as i32;
+        let bishops = board.piece_bb(PieceType::Bishop, Color::White).count() as i32
+            + board.piece_bb(PieceType::Bishop, Color::Black).count() as i32;
+        let rooks = board.piece_bb(PieceType::Rook, Color::White).count() as i32
+            + board.piece_bb(PieceType::Rook, Color::Black).count() as i32;
+        let queens = board.piece_bb(PieceType::Queen, Color::White).count() as i32
+            + board.piece_bb(PieceType::Queen, Color::Black).count() as i32;
+        
+        phase = knights + bishops + rooks * 2 + queens * 4;
+        
+        // Scale to 0-256 range (0 = endgame, 256 = midgame)
+        (phase * 256 / TOTAL_PHASE).min(256)
+    }
+
+    /// Calculate piece-square table score for a color with tapered evaluation
     fn piece_square_tables(board: &Board, color: Color) -> i32 {
         let mut score = 0;
 
@@ -455,9 +591,14 @@ impl Evaluation {
         let queen_bb = board.piece_bb(PieceType::Queen, color).as_u64();
         score += pst_eval(Self::get_queen_pst(), queen_bb);
 
-        // King PST
+        // King PST - TAPERED: blend midgame and endgame based on phase
         let king_bb = board.piece_bb(PieceType::King, color).as_u64();
-        score += pst_eval(Self::get_king_pst(), king_bb);
+        let phase = Self::calculate_phase(board);
+        let mg_king = pst_eval(Self::get_king_pst(), king_bb);
+        let eg_king = pst_eval(Self::get_king_endgame_pst(), king_bb);
+        // Blend: phase=256 means full midgame, phase=0 means full endgame
+        let tapered_king = (mg_king * phase + eg_king * (256 - phase)) / 256;
+        score += tapered_king;
 
         score
     }
@@ -559,6 +700,23 @@ impl Evaluation {
         &KING_PST
     }
 
+    /// Get king PST (endgame) - king should centralize in endgame
+    #[inline]
+    fn get_king_endgame_pst() -> &'static [i32; 64] {
+        // In endgame, king should move to center for active play
+        const KING_ENDGAME_PST: [i32; 64] = [
+            -50, -40, -30, -20, -20, -30, -40, -50,  // a1-h1: corners bad
+            -30, -20, -10,   0,   0, -10, -20, -30,  // a2-h2
+            -30, -10,  20,  30,  30,  20, -10, -30,  // a3-h3
+            -30, -10,  30,  40,  40,  30, -10, -30,  // a4-h4: center excellent
+            -30, -10,  30,  40,  40,  30, -10, -30,  // a5-h5: center excellent
+            -30, -10,  20,  30,  30,  20, -10, -30,  // a6-h6
+            -30, -30,   0,   0,   0,   0, -30, -30,  // a7-h7
+            -50, -30, -30, -30, -30, -30, -30, -50,  // a8-h8: back rank ok
+        ];
+        &KING_ENDGAME_PST
+    }
+
     /// Pawn piece-square table lookup
     #[allow(dead_code)]
     fn _pawn_pst(sq: Square, color: Color) -> i32 {
@@ -640,11 +798,11 @@ impl Evaluation {
         for file in 0..8 {
             let pawns_on_file = (pawns & Bitboard::file_mask(file)).count();
             if pawns_on_file > 1 {
-                score -= (pawns_on_file as i32 - 1) * 10;
+                score -= (pawns_on_file as i32 - 1) * 15; // INCREASED from 10
             }
         }
 
-        // Count isolated pawns
+        // Count isolated pawns - INCREASED PENALTY
         for sq in pawns.squares() {
             let file = file_of(sq);
             let has_left_support =
@@ -653,8 +811,27 @@ impl Evaluation {
                 file < 7 && (pawns & Bitboard::file_mask(file + 1)).as_u64() != 0;
 
             if !has_left_support && !has_right_support {
-                score -= 20; // Isolated pawn penalty
+                score -= 30; // INCREASED from 20 - isolated pawn is very bad
             }
+        }
+
+        // CRITICAL: Penalty for weak g-pawn moves (Grob opening prevention)
+        // Moving g-pawn early (g5 for white, g4 for black) is very dangerous
+        let g_file = 6;
+        let has_g2 = board.get_piece(6 + 8 * 1).is_some();
+        let has_g3 = board.get_piece(6 + 8 * 2).is_some();
+        let has_g7 = board.get_piece(6 + 8 * 6).is_some();
+        let has_g6 = board.get_piece(6 + 8 * 5).is_some();
+
+        // Check if g-pawn has moved from starting square
+        let g_pawn_advanced = if color == Color::White {
+            !has_g2 || (has_g3 && !has_g2) // g2 is empty or g3 is occupied
+        } else {
+            !has_g7 || (has_g6 && !has_g7)
+        };
+
+        if g_pawn_advanced {
+            score -= 40; // Penalty for advancing g-pawn (weakens king safety)
         }
 
         // Count passed pawns (simplified)
@@ -718,10 +895,10 @@ impl Evaluation {
         let mut score = 0;
         let occupied = board.occupied();
 
-        // Bishop pair bonus
+        // Bishop pair bonus (increased for endgame value)
         let bishops = board.piece_bb(PieceType::Bishop, color).count();
         if bishops >= 2 {
-            score += 30;
+            score += 45;
         }
 
         // Knight mobility

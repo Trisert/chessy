@@ -7,6 +7,65 @@ use crate::r#move::Move;
 use crate::utils::*;
 use crate::PromotionType;
 
+/// Pre-computed knight attack lookup table (computed at compile time)
+static KNIGHT_ATTACKS: [u64; 64] = compute_knight_attacks();
+
+/// Pre-computed king attack lookup table (computed at compile time)
+static KING_ATTACKS: [u64; 64] = compute_king_attacks();
+
+/// Compute knight attacks for all squares at compile time
+const fn compute_knight_attacks() -> [u64; 64] {
+    let mut attacks = [0u64; 64];
+    let mut sq = 0u8;
+    while sq < 64 {
+        let rank = sq / 8;
+        let file = sq % 8;
+        let mut bb = 0u64;
+
+        // Knight move patterns: (rank_delta, file_delta)
+        // (+2, +1), (+2, -1), (-2, +1), (-2, -1)
+        // (+1, +2), (+1, -2), (-1, +2), (-1, -2)
+        
+        if rank + 2 < 8 && file + 1 < 8 { bb |= 1u64 << ((rank + 2) * 8 + file + 1); }
+        if rank + 2 < 8 && file >= 1 { bb |= 1u64 << ((rank + 2) * 8 + file - 1); }
+        if rank >= 2 && file + 1 < 8 { bb |= 1u64 << ((rank - 2) * 8 + file + 1); }
+        if rank >= 2 && file >= 1 { bb |= 1u64 << ((rank - 2) * 8 + file - 1); }
+        if rank + 1 < 8 && file + 2 < 8 { bb |= 1u64 << ((rank + 1) * 8 + file + 2); }
+        if rank + 1 < 8 && file >= 2 { bb |= 1u64 << ((rank + 1) * 8 + file - 2); }
+        if rank >= 1 && file + 2 < 8 { bb |= 1u64 << ((rank - 1) * 8 + file + 2); }
+        if rank >= 1 && file >= 2 { bb |= 1u64 << ((rank - 1) * 8 + file - 2); }
+
+        attacks[sq as usize] = bb;
+        sq += 1;
+    }
+    attacks
+}
+
+/// Compute king attacks for all squares at compile time
+const fn compute_king_attacks() -> [u64; 64] {
+    let mut attacks = [0u64; 64];
+    let mut sq = 0u8;
+    while sq < 64 {
+        let rank = sq / 8;
+        let file = sq % 8;
+        let mut bb = 0u64;
+
+        // King moves: all 8 adjacent squares
+        if rank + 1 < 8 { bb |= 1u64 << ((rank + 1) * 8 + file); } // North
+        if rank >= 1 { bb |= 1u64 << ((rank - 1) * 8 + file); } // South
+        if file + 1 < 8 { bb |= 1u64 << (rank * 8 + file + 1); } // East
+        if file >= 1 { bb |= 1u64 << (rank * 8 + file - 1); } // West
+        if rank + 1 < 8 && file + 1 < 8 { bb |= 1u64 << ((rank + 1) * 8 + file + 1); } // NE
+        if rank + 1 < 8 && file >= 1 { bb |= 1u64 << ((rank + 1) * 8 + file - 1); } // NW
+        if rank >= 1 && file + 1 < 8 { bb |= 1u64 << ((rank - 1) * 8 + file + 1); } // SE
+        if rank >= 1 && file >= 1 { bb |= 1u64 << ((rank - 1) * 8 + file - 1); } // SW
+
+        attacks[sq as usize] = bb;
+        sq += 1;
+    }
+    attacks
+}
+
 /// Move generator
 pub struct MoveGen;
 
@@ -679,49 +738,16 @@ impl MoveGen {
         }
     }
 
-    /// Knight attacks from a square
+    /// Knight attacks from a square (lookup table)
+    #[inline]
     pub fn knight_attacks(sq: Square) -> Bitboard {
-        const KNIGHT_DELTAS: [i8; 8] = [-17, -15, -10, -6, 6, 10, 15, 17];
-        let mut attacks = Bitboard::EMPTY;
-
-        for &delta in &KNIGHT_DELTAS {
-            let target = (sq as i8 + delta) as u8;
-            if delta < 0 && target > sq {
-                continue; // Underflow
-            }
-            if delta > 0 && target < sq {
-                continue; // Overflow
-            }
-            if target < 64 {
-                if (rank_of(sq).abs_diff(rank_of(target)) <= 2)
-                    && (file_of(sq).abs_diff(file_of(target)) <= 2)
-                {
-                    attacks.set(target);
-                }
-            }
-        }
-
-        attacks
+        Bitboard::new(KNIGHT_ATTACKS[sq as usize])
     }
 
-    /// King attacks from a square
+    /// King attacks from a square (lookup table)
+    #[inline]
     pub fn king_attacks(sq: Square) -> Bitboard {
-        const KING_DELTAS: [i8; 8] = [-9, -8, -7, -1, 1, 7, 8, 9];
-        let mut attacks = Bitboard::EMPTY;
-
-        for &delta in &KING_DELTAS {
-            let target = (sq as i8 + delta) as u8;
-            // Check for underflow/overflow and that the target is on an adjacent square
-            if target < 64 {
-                let rank_diff = rank_of(sq).abs_diff(rank_of(target));
-                let file_diff = file_of(sq).abs_diff(file_of(target));
-                if rank_diff <= 1 && file_diff <= 1 {
-                    attacks.set(target);
-                }
-            }
-        }
-
-        attacks
+        Bitboard::new(KING_ATTACKS[sq as usize])
     }
 
     /// Bishop attacks (on-the-fly calculation)

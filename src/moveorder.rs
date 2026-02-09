@@ -132,20 +132,72 @@ pub fn see(board: &Board, mv: Move) -> i32 {
     swap_list[0]
 }
 
-/// Get all pieces attacking a square
+/// Get all pieces attacking a square using bitboard operations
 fn get_attackers(board: &Board, sq: u8) -> crate::bitboard::Bitboard {
+    use crate::magic;
+    use crate::movegen::MoveGen;
+    
+    let occupied = board.occupied();
     let mut attackers = crate::bitboard::Bitboard::new(0);
-
-    // Check all pieces that could attack this square
-    for from_sq in 0..64 {
-        if let Some(piece) = board.get_piece(from_sq) {
-            // Use pseudo-legal attack check
-            if is_piece_attacking(board, piece, from_sq, sq) {
-                attackers.set(from_sq);
+    
+    // Knights attacking this square
+    let knight_attacks = MoveGen::knight_attacks(sq);
+    attackers = attackers | (knight_attacks & (board.piece_bb(PieceType::Knight, Color::White) | board.piece_bb(PieceType::Knight, Color::Black)));
+    
+    // Kings attacking this square
+    let king_attacks = MoveGen::king_attacks(sq);
+    attackers = attackers | (king_attacks & (board.piece_bb(PieceType::King, Color::White) | board.piece_bb(PieceType::King, Color::Black)));
+    
+    // Bishops/Queens attacking diagonally
+    let bishop_attacks = magic::bishop_attacks(sq, occupied);
+    let bishops_queens = board.piece_bb(PieceType::Bishop, Color::White) 
+        | board.piece_bb(PieceType::Bishop, Color::Black)
+        | board.piece_bb(PieceType::Queen, Color::White)
+        | board.piece_bb(PieceType::Queen, Color::Black);
+    attackers = attackers | (bishop_attacks & bishops_queens);
+    
+    // Rooks/Queens attacking on ranks/files
+    let rook_attacks = magic::rook_attacks(sq, occupied);
+    let rooks_queens = board.piece_bb(PieceType::Rook, Color::White)
+        | board.piece_bb(PieceType::Rook, Color::Black)
+        | board.piece_bb(PieceType::Queen, Color::White)
+        | board.piece_bb(PieceType::Queen, Color::Black);
+    attackers = attackers | (rook_attacks & rooks_queens);
+    
+    // White pawns attacking this square (they attack from below)
+    let sq_rank = sq / 8;
+    let sq_file = sq % 8;
+    if sq_rank > 0 {
+        if sq_file > 0 {
+            let pawn_sq = sq - 9;
+            if board.piece_bb(PieceType::Pawn, Color::White).get(pawn_sq) {
+                attackers.set(pawn_sq);
+            }
+        }
+        if sq_file < 7 {
+            let pawn_sq = sq - 7;
+            if board.piece_bb(PieceType::Pawn, Color::White).get(pawn_sq) {
+                attackers.set(pawn_sq);
             }
         }
     }
-
+    
+    // Black pawns attacking this square (they attack from above)
+    if sq_rank < 7 {
+        if sq_file > 0 {
+            let pawn_sq = sq + 7;
+            if board.piece_bb(PieceType::Pawn, Color::Black).get(pawn_sq) {
+                attackers.set(pawn_sq);
+            }
+        }
+        if sq_file < 7 {
+            let pawn_sq = sq + 9;
+            if board.piece_bb(PieceType::Pawn, Color::Black).get(pawn_sq) {
+                attackers.set(pawn_sq);
+            }
+        }
+    }
+    
     attackers
 }
 
@@ -246,7 +298,7 @@ fn path_clear(board: &Board, from: u8, to: u8) -> bool {
     true
 }
 
-/// Find the least valuable attacker for a given side
+/// Find the least valuable attacker for a given side using bitboard operations
 fn find_least_valuable_attacker(
     board: &Board,
     occupied: &crate::bitboard::Bitboard,
@@ -264,10 +316,11 @@ fn find_least_valuable_attacker(
         PieceType::King,
     ] {
         let piece_bb = board.piece_bb(piece_type, color);
-
-        // Find intersection of attackers, our pieces of this type, and occupied
-        for sq in 0..64 {
-            if attackers.get(sq) && piece_bb.get(sq) && occupied.get(sq) {
+        // Find intersection: attackers AND our pieces of this type AND still occupied
+        let candidates = *attackers & piece_bb & *occupied;
+        if !candidates.is_empty() {
+            // Get the first (any) attacker of this type
+            if let Some(sq) = candidates.lsb() {
                 return Some((sq, piece_type));
             }
         }
@@ -276,30 +329,33 @@ fn find_least_valuable_attacker(
     None
 }
 
-/// Add any newly discovered attackers after a piece is removed
+/// Add any newly discovered attackers after a piece is removed (using magic bitboards)
 fn add_discovered_attackers(
     board: &Board,
     occupied: &crate::bitboard::Bitboard,
     target_sq: u8,
     attackers: &mut crate::bitboard::Bitboard,
 ) {
-    // Check sliding pieces that might now have line of sight
-    for sq in 0..64 {
-        if !occupied.get(sq) {
-            continue;
-        }
-
-        if let Some(piece) = board.get_piece(sq) {
-            if piece.piece_type == PieceType::Bishop
-                || piece.piece_type == PieceType::Rook
-                || piece.piece_type == PieceType::Queen
-            {
-                if is_piece_attacking(board, piece, sq, target_sq) && !attackers.get(sq) {
-                    attackers.set(sq);
-                }
-            }
-        }
-    }
+    use crate::magic;
+    
+    // Recalculate sliding piece attacks with the updated occupancy
+    // Bishops and queens on diagonals
+    let bishop_attacks = magic::bishop_attacks(target_sq, *occupied);
+    let bishops_queens = board.piece_bb(PieceType::Bishop, Color::White)
+        | board.piece_bb(PieceType::Bishop, Color::Black)
+        | board.piece_bb(PieceType::Queen, Color::White)
+        | board.piece_bb(PieceType::Queen, Color::Black);
+    let new_diagonal_attackers = bishop_attacks & bishops_queens & *occupied;
+    *attackers = *attackers | new_diagonal_attackers;
+    
+    // Rooks and queens on ranks/files
+    let rook_attacks = magic::rook_attacks(target_sq, *occupied);
+    let rooks_queens = board.piece_bb(PieceType::Rook, Color::White)
+        | board.piece_bb(PieceType::Rook, Color::Black)
+        | board.piece_bb(PieceType::Queen, Color::White)
+        | board.piece_bb(PieceType::Queen, Color::Black);
+    let new_straight_attackers = rook_attacks & rooks_queens & *occupied;
+    *attackers = *attackers | new_straight_attackers;
 }
 
 /// Check if a capture is "winning" (positive SEE)
@@ -640,11 +696,12 @@ impl Default for CountermoveTable {
 /// 6. Losing captures
 pub struct MovePicker {
     moves: MoveList,
-    scores: Vec<i32>,
+    scores: [i32; 256],
+    scores_len: usize,
     index: usize,
     tt_move: Option<Move>,
-    history_scores: Vec<i32>,
-    killer_scores: Vec<i32>,
+    history_scores: [i32; 256],
+    killer_scores: [i32; 256],
 }
 
 impl MovePicker {
@@ -665,11 +722,11 @@ impl MovePicker {
             position.state.castling_rights,
         );
 
-        // Pre-compute killer, history, and countermove scores to avoid lifetime issues
-        let num_moves = moves.len();
-        let mut history_scores = vec![0; num_moves];
-        let mut killer_scores = vec![0; num_moves];
-        let mut countermove_scores = vec![0; num_moves];
+        // Pre-compute killer, history, and countermove scores (stack-allocated)
+        let num_moves = moves.len().min(256);
+        let mut history_scores = [0i32; 256];
+        let mut killer_scores = [0i32; 256];
+        let mut countermove_scores = [0i32; 256];
 
         if let Some(killers) = killers {
             let killer_moves = killers.get(ply);
@@ -713,7 +770,8 @@ impl MovePicker {
         let side_to_move = position.state.side_to_move;
         let mut picker = MovePicker {
             moves,
-            scores: Vec::with_capacity(256),
+            scores: [0i32; 256],
+            scores_len: 0,
             index: 0,
             tt_move,
             history_scores,
@@ -753,15 +811,15 @@ impl MovePicker {
             temp
         };
 
-        let num_moves = filtered_moves.len();
         let side_to_move = position.state.side_to_move;
         let mut picker = MovePicker {
             moves: filtered_moves,
-            scores: Vec::with_capacity(256),
+            scores: [0i32; 256],
+            scores_len: 0,
             index: 0,
             tt_move: None,
-            history_scores: vec![0; num_moves],
-            killer_scores: vec![0; num_moves],
+            history_scores: [0i32; 256],
+            killer_scores: [0i32; 256],
         };
         picker.score_moves(&position.board, side_to_move, &[]);
         picker
@@ -850,12 +908,18 @@ impl MovePicker {
                         let to_rank = (to / 8) as i32;
                         let to_file = (to % 8) as i32;
 
-                        // Center control bonus (d4, e4, d5, e5 are best)
-                        let center_dist = ((to_file - 3).abs() + (to_file - 4).abs()).min(1)
-                            + ((to_rank - 3).abs() + (to_rank - 4).abs()).min(1);
-                        let center_bonus = (4 - center_dist) * 100; // Up to 400
+                        // IMPROVED: Granular center control bonus
+                        // Calculate actual distance from center (files d/e = 3/4, ranks 3/4 = 3/4)
+                        let center_file = if to_file <= 3 { 3.0 } else { 4.0 };
+                        let center_rank = if to_rank <= 3 { 3.0 } else { 4.0 };
+                        let dist_from_center = ((to_file as f64) - center_file).abs()
+                            + ((to_rank as f64) - center_rank).abs();
+
+                        // Bonus decreases with distance: 400 (center) down to 0 (edges)
+                        let center_bonus = (400.0 - (dist_from_center * 80.0)).max(0.0) as i32;
 
                         // Pawn advancement bonus
+                        // CRITICAL: Heavy penalty for g-pawn advances in opening (Grob prevention)
                         let pawn_bonus = if piece.piece_type == PieceType::Pawn {
                             // Flip rank for black pawns
                             let rank = if side_to_move == Color::White {
@@ -863,12 +927,29 @@ impl MovePicker {
                             } else {
                                 7 - to_rank
                             };
-                            rank * 50 // Encourage pawn advancement
+
+                            // CRITICAL: Penalty for g-pawn advances to g3/g4 (White) or g6/g5 (Black)
+                            // These moves weaken king safety drastically and should be heavily penalized
+                            let g_pawn_penalty = if to_file == 6 {
+                                // g-file pawn (file index 6 = g-file)
+                                // Penalty for g3/g4 for White, g6/g5 for Black (ranks 1-3 from perspective)
+                                // Increased penalty range to catch more dangerous g-pawn moves
+                                if rank >= 1 && rank <= 3 {
+                                    -1500 // MASSIVE penalty - Grob opening prevention (increased)
+                                } else {
+                                    0
+                                }
+                            } else {
+                                0
+                            };
+
+                            (rank * 50) + g_pawn_penalty // Normal advancement + Grob penalty
                         } else {
                             0
                         };
 
                         // Development bonus for knights/bishops moving off back rank
+                        // HIGHER bonus for developing to center vs edge
                         let dev_bonus = if piece.piece_type == PieceType::Knight
                             || piece.piece_type == PieceType::Bishop
                         {
@@ -879,10 +960,11 @@ impl MovePicker {
                                 7 - from_rank
                             };
                             if from_rank_adj == 0 {
-                                200
+                                // Bonus based on destination: center gets more
+                                (center_bonus / 2) + 100 // Up to 300 bonus for center development
                             } else {
                                 0
-                            } // Bonus for leaving back rank
+                            }
                         } else {
                             0
                         };
@@ -892,8 +974,9 @@ impl MovePicker {
                 }
             }
 
-            self.scores.push(score);
+            self.scores[i] = score;
         }
+        self.scores_len = self.moves.len();
     }
 
     /// Get the next move (returns None when exhausted)

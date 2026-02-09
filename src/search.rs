@@ -269,11 +269,9 @@ impl Search {
 
     /// Run an iterative deepening search
     pub fn search(&mut self, position: &Position, depth: u32, time_ms: Option<u64>) -> (Move, i32) {
-        if self.threads > 1 {
-            self.search_parallel(position, depth, time_ms)
-        } else {
-            self.search_single_thread(position, depth, time_ms)
-        }
+        // FIXME: Parallel search is broken (creates fresh TT per thread, floods info output)
+        // Force single-threaded until properly fixed
+        self.search_single_thread(position, depth, time_ms)
     }
 
     /// Single-threaded search
@@ -347,9 +345,9 @@ impl Search {
             // For parallel search, split root moves among threads
             let depth_best = self.search_root_parallel(position, d, &legal_moves);
 
-            if self.should_stop() {
-                break;
-            }
+            // BUG FIX: Don't check should_stop after search_root_parallel completes!
+            // The search has already finished, so we should use the result even if time is up.
+            // The time limit only applies to starting new searches, not using completed results.
 
             if let Some((mv, score)) = depth_best {
                 // Validate the move
@@ -445,8 +443,9 @@ impl Search {
                 thread_search.time_limit.set(time_limit);
 
                 // Search this line - alphabeta checks time internally via should_stop()
+                // BUG FIX: Don't subtract 1 from depth - we want to search to the full requested depth
                 let (_, score) =
-                    thread_search.alphabeta(&mut thread_pos, depth - 1, -32000, 32000, 1, Some(mv));
+                    thread_search.alphabeta(&mut thread_pos, depth, -32000, 32000, 1, Some(mv));
                 let score = -score; // Negate for the other side's perspective
 
                 // Get the node count from this thread

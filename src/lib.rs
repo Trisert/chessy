@@ -13,6 +13,7 @@ pub mod board;
 pub mod castling;
 pub mod evaluation;
 pub mod magic;
+pub mod r#match;
 pub mod movelist;
 pub mod moveorder;
 pub mod position;
